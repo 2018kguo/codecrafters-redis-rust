@@ -1,9 +1,14 @@
-// Uncomment this block to pass the first stage
 use std::io;
+
+// Uncomment this block to pass the first stage
+use anyhow::Result;
+use serializer::{parse_resp_data, RespData};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-async fn handle_connection(mut stream: TcpStream) -> io::Result<()> {
+mod serializer;
+
+async fn handle_connection(mut stream: TcpStream) -> Result<()> {
     // Primer on sockets: https://docs.python.org/3/howto/sockets.html
     let mut buf = [0; 512];
     loop {
@@ -13,11 +18,28 @@ async fn handle_connection(mut stream: TcpStream) -> io::Result<()> {
                 return Ok(());
             }
             Ok(_n) => {
+                let (resp, _) = parse_resp_data(&buf)?;
+                let commands_list = resp.serialize_to_list_of_lowercase_strings();
+                match commands_list[0].as_str() {
+                    "echo" => {
+                        let echo_resp = RespData::unpack_array(&resp);
+                        let serialized_resp = echo_resp[1].serialize_to_redis_protocol();
+                        stream.write_all(serialized_resp.as_bytes()).await?;
+                    }
+                    "ping" => {
+                        stream.write_all("+PONG\r\n".as_bytes()).await?;
+                    }
+                    _ => {
+                        stream
+                            .write_all("-ERR unknown command\r\n".as_bytes())
+                            .await?;
+                    }
+                }
                 // respond with PONG for this part
-                stream.write_all("+PONG\r\n".as_bytes()).await.unwrap();
+                // stream.write_all("+PONG\r\n".as_bytes()).await.unwrap();
             }
             Err(e) => {
-                return Err(e);
+                return Err(e.into());
             }
         }
     }
