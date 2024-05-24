@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum RespData {
+    SimpleString(String),
     BulkString(String),
     Array(Vec<RespData>),
 }
@@ -9,6 +10,7 @@ pub enum RespData {
 impl RespData {
     pub fn serialize_to_redis_protocol(&self) -> String {
         match self {
+            RespData::SimpleString(data) => format!("+{}\r\n", data),
             RespData::BulkString(data) => format!("${}\r\n{}\r\n", data.len(), data),
             RespData::Array(data) => {
                 let mut serialized_data = String::from("*");
@@ -22,16 +24,22 @@ impl RespData {
         }
     }
 
-    pub fn serialize_to_list_of_lowercase_strings(&self) -> Vec<String> {
-        match self {
-            RespData::BulkString(data) => vec![data.to_lowercase()],
+    pub fn serialize_to_list_of_strings(&self, lowercase: bool) -> Vec<String> {
+        let string_vec = match self {
+            RespData::SimpleString(data) => vec![data.to_string()],
+            RespData::BulkString(data) => vec![data.to_string()],
             RespData::Array(data) => {
                 let mut serialized_data = Vec::new();
                 for d in data {
-                    serialized_data.append(&mut d.serialize_to_list_of_lowercase_strings());
+                    serialized_data.append(&mut d.serialize_to_list_of_strings(lowercase));
                 }
                 serialized_data
             }
+        };
+        if lowercase {
+            string_vec.iter().map(|s| s.to_lowercase()).collect()
+        } else {
+            string_vec
         }
     }
 
@@ -43,11 +51,11 @@ impl RespData {
     }
 }
 
-// *2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n
 pub fn parse_resp_data(bytes: &[u8]) -> Result<(RespData, usize)> {
     match bytes[0] as char {
         '$' => parse_bulk_string(bytes),
         '*' => parse_array(bytes),
+        '+' => parse_simple_string(bytes),
         _ => unimplemented!(),
     }
 }
@@ -68,6 +76,18 @@ fn parse_bulk_string(bytes: &[u8]) -> Result<(RespData, usize)> {
     Ok((
         RespData::BulkString(data.to_string()),
         end_of_bulk_string_index + 2,
+    ))
+}
+
+fn parse_simple_string(_bytes: &[u8]) -> Result<(RespData, usize)> {
+    let (data, bytes_read) = read_until_crlf(&_bytes[1..]).context("Failed to read until CRLF")?;
+    Ok((
+        RespData::SimpleString(
+            std::str::from_utf8(data)
+                .context("Failed to parse data")?
+                .to_string(),
+        ),
+        bytes_read + 2,
     ))
 }
 
@@ -125,6 +145,14 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_simple_string() {
+        let bytes = b"+OK\r\n";
+        let (resp_data, bytes_read) = parse_simple_string(bytes).unwrap();
+        assert_eq!(bytes_read, 6);
+        assert_eq!(resp_data, RespData::SimpleString("OK".to_string()));
+    }
+
+    #[test]
     fn test_serialize_to_redis_protocol() {
         let resp_data = RespData::Array(vec![
             RespData::BulkString("ECHO".to_string()),
@@ -143,7 +171,7 @@ mod tests {
             RespData::BulkString("hey".to_string()),
         ]);
         assert_eq!(
-            resp_data.serialize_to_list_of_lowercase_strings(),
+            resp_data.serialize_to_list_of_strings(true),
             vec!["echo", "hey"]
         );
     }

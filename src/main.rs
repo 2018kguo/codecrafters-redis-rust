@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 
 // Uncomment this block to pass the first stage
@@ -11,6 +12,8 @@ mod serializer;
 async fn handle_connection(mut stream: TcpStream) -> Result<()> {
     // Primer on sockets: https://docs.python.org/3/howto/sockets.html
     let mut buf = [0; 512];
+    let mut local_hashmap_storage: HashMap<String, String> = std::collections::HashMap::new();
+
     loop {
         match stream.read(&mut buf).await {
             Ok(0) => {
@@ -19,7 +22,7 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
             }
             Ok(_n) => {
                 let (resp, _) = parse_resp_data(&buf)?;
-                let commands_list = resp.serialize_to_list_of_lowercase_strings();
+                let commands_list = resp.serialize_to_list_of_strings(true);
                 match commands_list[0].as_str() {
                     "echo" => {
                         let echo_resp = RespData::unpack_array(&resp);
@@ -29,14 +32,37 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
                     "ping" => {
                         stream.write_all("+PONG\r\n".as_bytes()).await?;
                     }
+                    "set" => {
+                        let set_resp = RespData::unpack_array(&resp);
+                        let key_str = set_resp[1].serialize_to_list_of_strings(false)[0].clone();
+                        let value_str = set_resp[2].serialize_to_list_of_strings(false)[0].clone();
+                        local_hashmap_storage.insert(key_str, value_str);
+                        // return OK as a simple string
+                        stream.write_all("+OK\r\n".as_bytes()).await?;
+                    }
+                    "get" => {
+                        let get_resp = RespData::unpack_array(&resp);
+                        let key_str = get_resp[1].serialize_to_list_of_strings(false)[0].clone();
+                        match local_hashmap_storage.get(&key_str) {
+                            Some(value) => {
+                                let resp_response = RespData::SimpleString(value.clone());
+                                stream
+                                    .write_all(
+                                        resp_response.serialize_to_redis_protocol().as_bytes(),
+                                    )
+                                    .await?;
+                            }
+                            None => {
+                                stream.write_all("$-1\r\n".as_bytes()).await?;
+                            }
+                        }
+                    }
                     _ => {
                         stream
                             .write_all("-ERR unknown command\r\n".as_bytes())
                             .await?;
                     }
                 }
-                // respond with PONG for this part
-                // stream.write_all("+PONG\r\n".as_bytes()).await.unwrap();
             }
             Err(e) => {
                 return Err(e.into());
