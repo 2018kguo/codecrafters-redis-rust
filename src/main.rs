@@ -54,10 +54,44 @@ async fn main() -> io::Result<()> {
         let master_ip = replica_info_split[0];
         let master_port = replica_info_split[1];
         let mut stream = TcpStream::connect(format!("{}:{}", master_ip, master_port)).await?;
+
+        // send the initial PING command to the master
         let ping_redis_command = RespData::Array(vec![RespData::SimpleString("PING".to_string())]);
         stream
             .write_all(ping_redis_command.serialize_to_redis_protocol().as_bytes())
             .await?;
+        stream.flush().await?;
+        // wait for the PONG response from the master
+        stream.read(&mut [0; 512]).await?;
+        // send REPLCONF listening-port <port> command to the master as an array of bulk strings
+        let listening_port_command = RespData::Array(vec![
+            RespData::BulkString("REPLCONF".to_string()),
+            RespData::BulkString("listening-port".to_string()),
+            RespData::BulkString(port_to_use.to_string()),
+        ]);
+        stream
+            .write_all(
+                listening_port_command
+                    .serialize_to_redis_protocol()
+                    .as_bytes(),
+            )
+            .await?;
+        stream.flush().await?;
+        // wait for the reply from the master
+        stream.read(&mut [0; 512]).await?;
+
+        // send REPLCONF capa psync2 command to the master as an array of bulk strings
+        let capa_command = RespData::Array(vec![
+            RespData::BulkString("REPLCONF".to_string()),
+            RespData::BulkString("capa".to_string()),
+            RespData::BulkString("psync2".to_string()),
+        ]);
+        stream
+            .write_all(capa_command.serialize_to_redis_protocol().as_bytes())
+            .await?;
+        stream.flush().await?;
+        // wait for the final reply from the master
+        stream.read(&mut [0; 512]).await?;
     }
     let server_info = Arc::new(Mutex::new(ServerInfo {
         role: role.to_string(),
