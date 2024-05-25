@@ -4,6 +4,7 @@ use std::{io, time};
 // Uncomment this block to pass the first stage
 use anyhow::Result;
 use serializer::{parse_resp_data, RespData};
+use std::env;
 use std::sync::Arc;
 use time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -122,12 +123,16 @@ async fn handle_connection(
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
+    let args: Vec<String> = env::args().collect();
+    let mut port_to_use = 6379;
+    let port_flag_position = args.iter().position(|s| s == "--port");
+    if let Some(pos) = port_flag_position {
+        port_to_use = args[pos + 1].parse().unwrap();
+    }
 
+    let sock = format!("127.0.0.1:{}", port_to_use);
     let storage: Arc<Mutex<HashMap<String, StoredValue>>> = Arc::new(Mutex::new(HashMap::new()));
-    // Uncomment this block to pass the fist stag
-    //
-    let listener = TcpListener::bind("127.0.0.1:6379").await?;
+    let listener = TcpListener::bind(sock).await?;
 
     loop {
         let (stream, _) = listener.accept().await?;
