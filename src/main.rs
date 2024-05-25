@@ -25,15 +25,24 @@ struct ServerInfo {
 async fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut port_to_use = 6379;
+    let mut replica_info: Option<String> = None;
+
     let port_flag_position = args.iter().position(|s| s == "--port");
     if let Some(pos) = port_flag_position {
         port_to_use = args[pos + 1].parse().unwrap();
+    }
+    let replica_flag_position = args.iter().position(|s| s == "--replicaof");
+    if let Some(pos) = replica_flag_position {
+        replica_info = Some(args[pos + 1].clone());
     }
 
     let sock = format!("127.0.0.1:{}", port_to_use);
     let storage: Arc<Mutex<HashMap<String, StoredValue>>> = Arc::new(Mutex::new(HashMap::new()));
     let server_info = Arc::new(Mutex::new(ServerInfo {
-        role: "master".to_string(),
+        role: match replica_info {
+            Some(_) => "slave".to_string(),
+            None => "master".to_string(),
+        },
     }));
     let listener = TcpListener::bind(sock).await?;
 
