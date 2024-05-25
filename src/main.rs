@@ -1,18 +1,27 @@
 use std::collections::HashMap;
-use std::io;
+use std::{io, time};
 
 // Uncomment this block to pass the first stage
 use anyhow::Result;
 use serializer::{parse_resp_data, RespData};
+use std::sync::Arc;
+use time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-
+use tokio::sync::Mutex;
 mod serializer;
 
-async fn handle_connection(mut stream: TcpStream) -> Result<()> {
+struct StoredValue {
+    value: String,
+    expiry: Option<Instant>,
+}
+
+async fn handle_connection(
+    mut stream: TcpStream,
+    storage: Arc<Mutex<HashMap<String, StoredValue>>>,
+) -> Result<()> {
     // Primer on sockets: https://docs.python.org/3/howto/sockets.html
     let mut buf = [0; 512];
-    let mut local_hashmap_storage: HashMap<String, String> = std::collections::HashMap::new();
 
     loop {
         match stream.read(&mut buf).await {
@@ -34,25 +43,65 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
                     }
                     "set" => {
                         let set_resp = RespData::unpack_array(&resp);
+                        // the second element in the array is the key
                         let key_str = set_resp[1].serialize_to_list_of_strings(false)[0].clone();
+                        // the third element in the array is the value
                         let value_str = set_resp[2].serialize_to_list_of_strings(false)[0].clone();
-                        local_hashmap_storage.insert(key_str, value_str);
+                        // px argument is being provided
+                        if set_resp.len() > 3 {
+                            let arg = set_resp[3].serialize_to_list_of_strings(true)[0].clone();
+                            if arg == "px" {
+                                let expiry_milliseconds: usize = set_resp[4]
+                                    .serialize_to_list_of_strings(false)[0]
+                                    .clone()
+                                    .parse()?;
+                                let expiry = Instant::now()
+                                    + Duration::from_millis(expiry_milliseconds as u64);
+                                let mut held_storage = storage.lock().await;
+                                held_storage.insert(
+                                    key_str,
+                                    StoredValue {
+                                        value: value_str,
+                                        expiry: Some(expiry),
+                                    },
+                                );
+                            } else {
+                                return Err(anyhow::anyhow!("Invalid argument"));
+                            }
+                        } else {
+                            let mut held_storage = storage.lock().await;
+                            held_storage.insert(
+                                key_str,
+                                StoredValue {
+                                    value: value_str,
+                                    expiry: None,
+                                },
+                            );
+                        }
                         // return OK as a simple string
                         stream.write_all("+OK\r\n".as_bytes()).await?;
                     }
                     "get" => {
+                        println!("Received get command");
                         let get_resp = RespData::unpack_array(&resp);
                         let key_str = get_resp[1].serialize_to_list_of_strings(false)[0].clone();
-                        match local_hashmap_storage.get(&key_str) {
-                            Some(value) => {
-                                let resp_response = RespData::SimpleString(value.clone());
+                        let held_storage = storage.lock().await;
+                        match held_storage.get(&key_str) {
+                            Some(stored_value)
+                                if stored_value.expiry.is_none()
+                                    || stored_value.expiry.unwrap() > Instant::now() =>
+                            {
+                                let string_value = stored_value.value.clone();
+                                let resp_response = RespData::SimpleString(string_value);
                                 stream
                                     .write_all(
                                         resp_response.serialize_to_redis_protocol().as_bytes(),
                                     )
                                     .await?;
                             }
-                            None => {
+                            // Key has either expired or never existed in the map.
+                            _ => {
+                                println!("Key not found");
                                 stream.write_all("$-1\r\n".as_bytes()).await?;
                             }
                         }
@@ -74,16 +123,17 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
 
-    // Uncomment this block to pass the fist stage
+    let storage: Arc<Mutex<HashMap<String, StoredValue>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Uncomment this block to pass the fist stag
     //
     let listener = TcpListener::bind("127.0.0.1:6379").await?;
 
     loop {
         let (stream, _) = listener.accept().await?;
+        let storage = storage.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream).await {
+            if let Err(e) = handle_connection(stream, storage).await {
                 eprintln!("Error handling connection: {}", e);
             }
         });
