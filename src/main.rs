@@ -92,6 +92,18 @@ async fn main() -> io::Result<()> {
         stream.flush().await?;
         // wait for the final reply from the master
         stream.read(&mut [0; 512]).await?;
+
+        // lastly, send the PSYNC command to the master
+        let psync_command = RespData::Array(vec![
+            RespData::BulkString("PSYNC".to_string()),
+            RespData::BulkString("?".to_string()),
+            RespData::BulkString("-1".to_string()),
+        ]);
+        stream
+            .write_all(psync_command.serialize_to_redis_protocol().as_bytes())
+            .await?;
+        stream.flush().await?;
+        stream.read(&mut [0; 512]).await?;
     }
     let server_info = Arc::new(Mutex::new(ServerInfo {
         role: role.to_string(),
