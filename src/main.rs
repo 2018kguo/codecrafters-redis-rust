@@ -44,11 +44,23 @@ async fn main() -> io::Result<()> {
 
     let sock = format!("127.0.0.1:{}", port_to_use);
     let storage: Arc<Mutex<HashMap<String, StoredValue>>> = Arc::new(Mutex::new(HashMap::new()));
+    let role = match replica_info {
+        Some(_) => "slave",
+        None => "master",
+    };
+    if role == "slave" {
+        let replica_info = replica_info.unwrap();
+        let replica_info_split: Vec<&str> = replica_info.split(' ').collect();
+        let master_ip = replica_info_split[0];
+        let master_port = replica_info_split[1];
+        let mut stream = TcpStream::connect(format!("{}:{}", master_ip, master_port)).await?;
+        let ping_redis_command = RespData::Array(vec![RespData::SimpleString("PING".to_string())]);
+        stream
+            .write_all(ping_redis_command.serialize_to_redis_protocol().as_bytes())
+            .await?;
+    }
     let server_info = Arc::new(Mutex::new(ServerInfo {
-        role: match replica_info {
-            Some(_) => "slave".to_string(),
-            None => "master".to_string(),
-        },
+        role: role.to_string(),
         master_replid,
         master_repl_offset,
     }));
@@ -73,6 +85,7 @@ async fn handle_connection(
 ) -> Result<()> {
     // Primer on sockets: https://docs.python.org/3/howto/sockets.html
     let mut buf = [0; 512];
+    let mut accumulated_data = Vec::new();
 
     loop {
         match stream.read(&mut buf).await {
@@ -81,7 +94,13 @@ async fn handle_connection(
                 return Ok(());
             }
             Ok(_n) => {
-                let (resp, _) = parse_resp_data(&buf)?;
+                accumulated_data.extend_from_slice(&buf);
+                let parse_result = parse_resp_data(&buf);
+                if parse_result.is_err() {
+                    continue;
+                }
+                let (resp, bytes_read) = parse_result.unwrap();
+                accumulated_data = accumulated_data[bytes_read..].to_vec();
                 let commands_list = resp.serialize_to_list_of_strings(true);
                 match commands_list[0].as_str() {
                     "echo" => {
@@ -133,7 +152,6 @@ async fn handle_connection(
                         stream.write_all("+OK\r\n".as_bytes()).await?;
                     }
                     "get" => {
-                        println!("Received get command");
                         let get_resp = RespData::unpack_array(&resp);
                         let key_str = get_resp[1].serialize_to_list_of_strings(false)[0].clone();
                         let held_storage = storage.lock().await;
