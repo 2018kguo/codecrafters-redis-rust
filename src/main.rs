@@ -1,11 +1,11 @@
-use std::collections::HashMap;
-use std::{io, time};
-
-// Uncomment this block to pass the first stage
 use anyhow::Result;
 use serializer::{parse_resp_data, RespData};
+use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
 use std::env;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
+use std::{io, time};
 use time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -19,6 +19,8 @@ struct StoredValue {
 
 struct ServerInfo {
     role: String,
+    master_replid: String,
+    master_repl_offset: usize,
 }
 
 #[tokio::main]
@@ -36,6 +38,10 @@ async fn main() -> io::Result<()> {
         replica_info = Some(args[pos + 1].clone());
     }
 
+    // generate 40 character long random string for the master_replid
+    let master_replid: String = get_random_string(40);
+    let master_repl_offset = 0;
+
     let sock = format!("127.0.0.1:{}", port_to_use);
     let storage: Arc<Mutex<HashMap<String, StoredValue>>> = Arc::new(Mutex::new(HashMap::new()));
     let server_info = Arc::new(Mutex::new(ServerInfo {
@@ -43,6 +49,8 @@ async fn main() -> io::Result<()> {
             Some(_) => "slave".to_string(),
             None => "master".to_string(),
         },
+        master_replid,
+        master_repl_offset,
     }));
     let listener = TcpListener::bind(sock).await?;
 
@@ -150,10 +158,16 @@ async fn handle_connection(
                         }
                     }
                     "info" => {
+                        // ex: redis-cli INFO replication
+                        // still need to actually parse the argument but this works for now
                         let server_info = server_info.lock().await;
                         let role = &server_info.role;
 
-                        let info_resp_response = RespData::BulkString(format!("role:{}", role));
+                        let replication_info = format!(
+                            "role:{}\nmaster_replid:{}\nmaster_repl_offset:{}",
+                            role, server_info.master_replid, server_info.master_repl_offset
+                        );
+                        let info_resp_response = RespData::BulkString(replication_info);
                         stream
                             .write_all(info_resp_response.serialize_to_redis_protocol().as_bytes())
                             .await?;
@@ -170,4 +184,13 @@ async fn handle_connection(
             }
         }
     }
+}
+
+fn get_random_string(len: usize) -> String {
+    let mut random_string = String::new();
+    for _ in 0..len {
+        let random_value = RandomState::new().build_hasher().finish() as usize;
+        random_string.push_str(&random_value.to_string());
+    }
+    random_string
 }
