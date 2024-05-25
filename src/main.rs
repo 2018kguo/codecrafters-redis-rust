@@ -17,9 +17,42 @@ struct StoredValue {
     expiry: Option<Instant>,
 }
 
+struct ServerInfo {
+    role: String,
+}
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    let mut port_to_use = 6379;
+    let port_flag_position = args.iter().position(|s| s == "--port");
+    if let Some(pos) = port_flag_position {
+        port_to_use = args[pos + 1].parse().unwrap();
+    }
+
+    let sock = format!("127.0.0.1:{}", port_to_use);
+    let storage: Arc<Mutex<HashMap<String, StoredValue>>> = Arc::new(Mutex::new(HashMap::new()));
+    let server_info = Arc::new(Mutex::new(ServerInfo {
+        role: "master".to_string(),
+    }));
+    let listener = TcpListener::bind(sock).await?;
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let storage = storage.clone();
+        let server_info = server_info.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, storage, server_info).await {
+                eprintln!("Error handling connection: {}", e);
+            }
+        });
+    }
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
+    server_info: Arc<Mutex<ServerInfo>>,
 ) -> Result<()> {
     // Primer on sockets: https://docs.python.org/3/howto/sockets.html
     let mut buf = [0; 512];
@@ -107,6 +140,15 @@ async fn handle_connection(
                             }
                         }
                     }
+                    "info" => {
+                        let server_info = server_info.lock().await;
+                        let role = &server_info.role;
+
+                        let info_resp_response = RespData::BulkString(format!("role:{}", role));
+                        stream
+                            .write_all(info_resp_response.serialize_to_redis_protocol().as_bytes())
+                            .await?;
+                    }
                     _ => {
                         stream
                             .write_all("-ERR unknown command\r\n".as_bytes())
@@ -118,29 +160,5 @@ async fn handle_connection(
                 return Err(e.into());
             }
         }
-    }
-}
-
-#[tokio::main]
-async fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let mut port_to_use = 6379;
-    let port_flag_position = args.iter().position(|s| s == "--port");
-    if let Some(pos) = port_flag_position {
-        port_to_use = args[pos + 1].parse().unwrap();
-    }
-
-    let sock = format!("127.0.0.1:{}", port_to_use);
-    let storage: Arc<Mutex<HashMap<String, StoredValue>>> = Arc::new(Mutex::new(HashMap::new()));
-    let listener = TcpListener::bind(sock).await?;
-
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let storage = storage.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, storage).await {
-                eprintln!("Error handling connection: {}", e);
-            }
-        });
     }
 }

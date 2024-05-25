@@ -175,4 +175,12 @@ mod tests {
             vec!["echo", "hey"]
         );
     }
+
+    #[test]
+    fn test_serialize_multiline_bulk_string() {
+        let bytes = b"$11\r\nhello\nworld\r\n";
+        let (resp_data, bytes_read) = parse_bulk_string(bytes).unwrap();
+        assert_eq!(bytes_read, 18);
+        assert_eq!(resp_data, RespData::BulkString("hello\nworld".to_string()));
+    }
 }
