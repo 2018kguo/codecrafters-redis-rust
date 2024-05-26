@@ -268,6 +268,13 @@ async fn handle_connection(
                                     .as_bytes(),
                             )
                             .await?;
+                        stream.flush().await?;
+                        // lastly, send an empty RDB file back to the replica
+                        let hardcoded_empty_rdb_file_hex = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
+                        let binary_empty_rdb = decode_hex_string(hardcoded_empty_rdb_file_hex)?;
+                        let len = binary_empty_rdb.len();
+                        let _ = stream.write_all(format!("${}\r\n", len).as_bytes()).await?;
+                        let _ = stream.write_all(&binary_empty_rdb).await?;
                     }
                     _ => {
                         stream
@@ -290,4 +297,20 @@ fn get_random_string(len: usize) -> String {
         random_string.push_str(&random_value.to_string());
     }
     random_string
+}
+
+fn decode_hex_string(hex: &str) -> Result<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return Err(anyhow::anyhow!("Invalid hex string length"));
+    }
+
+    let mut binary_data = Vec::new();
+
+    for i in (0..hex.len()).step_by(2) {
+        let byte_str = &hex[i..i + 2];
+        let byte = u8::from_str_radix(byte_str, 16)?;
+        binary_data.push(byte);
+    }
+
+    Ok(binary_data)
 }
