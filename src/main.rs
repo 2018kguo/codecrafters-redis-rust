@@ -158,6 +158,7 @@ async fn handle_connection(
                             .await?;
                     }
                     "psync" => {
+                        println!("Received PSYNC command");
                         handle_psync_command(
                             &mut stream,
                             server_info.clone(),
@@ -346,20 +347,29 @@ async fn handle_psync_command(
     let psync_resp = RespData::unpack_array(resp);
     let _replication_id = psync_resp[1].serialize_to_list_of_strings(false)[0].clone();
     let _offset = psync_resp[2].serialize_to_list_of_strings(false)[0].clone();
-    // Respond with +FULLRESYNC <replid> <offset>
-    let server_info = server_info.lock().await;
-    let full_resync_response = RespData::SimpleString(format!(
-        "+FULLRESYNC {} {}",
-        server_info.master_replid, server_info.master_repl_offset
-    ));
-    stream
-        .write_all(
-            full_resync_response
-                .serialize_to_redis_protocol()
-                .as_bytes(),
-        )
-        .await?;
-    stream.flush().await?;
+    
+    // !! VERY IMPORTANT !!
+    // Make sure that the lock on the server_info is released before entering the receiver loop 
+    // because otherwise the lock on server_info will be indefinitely held by this replica green
+    // thread and no other replicas will be able to connect to the server since they will try
+    // to acquire the lock on server_info as well
+    {
+        // Respond with +FULLRESYNC <replid> <offset>
+        let server_info = server_info.lock().await;
+        let full_resync_response = RespData::SimpleString(format!(
+            "+FULLRESYNC {} {}",
+            server_info.master_replid, server_info.master_repl_offset
+        ));
+        stream
+            .write_all(
+                full_resync_response
+                    .serialize_to_redis_protocol()
+                    .as_bytes(),
+            )
+            .await?;
+        stream.flush().await?;
+    }
+
     // lastly, send an empty RDB file back to the replica
     let hardcoded_empty_rdb_file_hex = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
     let binary_empty_rdb = decode_hex_string(hardcoded_empty_rdb_file_hex)?;
