@@ -115,7 +115,7 @@ fn read_until_crlf(buffer: &[u8]) -> Option<(&[u8], usize)> {
             return Some((&buffer[0..(i - 1)], i + 1));
         }
     }
-    return None;
+    None
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::env;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
-use std::{io, time};
+use std::time;
 use time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -24,7 +24,7 @@ struct ServerInfo {
 }
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut port_to_use = 6379;
     let mut replica_info: Option<String> = None;
@@ -62,7 +62,10 @@ async fn main() -> io::Result<()> {
             .await?;
         stream.flush().await?;
         // wait for the PONG response from the master
-        stream.read(&mut [0; 512]).await?;
+        let n = stream.read(&mut [0; 512]).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!("Connection closed on master"));
+        }
         // send REPLCONF listening-port <port> command to the master as an array of bulk strings
         let listening_port_command = RespData::Array(vec![
             RespData::BulkString("REPLCONF".to_string()),
@@ -78,7 +81,10 @@ async fn main() -> io::Result<()> {
             .await?;
         stream.flush().await?;
         // wait for the reply from the master
-        stream.read(&mut [0; 512]).await?;
+        let n = stream.read(&mut [0; 512]).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!("Connection closed on master"));
+        }
 
         // send REPLCONF capa psync2 command to the master as an array of bulk strings
         let capa_command = RespData::Array(vec![
@@ -91,7 +97,10 @@ async fn main() -> io::Result<()> {
             .await?;
         stream.flush().await?;
         // wait for the final reply from the master
-        stream.read(&mut [0; 512]).await?;
+        let n = stream.read(&mut [0; 512]).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!("Connection closed on master"));
+        }
 
         // lastly, send the PSYNC command to the master
         let psync_command = RespData::Array(vec![
@@ -103,7 +112,10 @@ async fn main() -> io::Result<()> {
             .write_all(psync_command.serialize_to_redis_protocol().as_bytes())
             .await?;
         stream.flush().await?;
-        stream.read(&mut [0; 512]).await?;
+        let n = stream.read(&mut [0; 512]).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!("Connection closed on master"));
+        }
     }
     let server_info = Arc::new(Mutex::new(ServerInfo {
         role: role.to_string(),
@@ -273,8 +285,8 @@ async fn handle_connection(
                         let hardcoded_empty_rdb_file_hex = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
                         let binary_empty_rdb = decode_hex_string(hardcoded_empty_rdb_file_hex)?;
                         let len = binary_empty_rdb.len();
-                        let _ = stream.write_all(format!("${}\r\n", len).as_bytes()).await?;
-                        let _ = stream.write_all(&binary_empty_rdb).await?;
+                        stream.write_all(format!("${}\r\n", len).as_bytes()).await?;
+                        stream.write_all(&binary_empty_rdb).await?;
                     }
                     _ => {
                         stream
