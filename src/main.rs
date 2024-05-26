@@ -236,6 +236,17 @@ async fn handle_connection(
                             .write_all(info_resp_response.serialize_to_redis_protocol().as_bytes())
                             .await?;
                     }
+                    "replconf" => {
+                        let replconf_resp = RespData::unpack_array(&resp);
+                        let _subcommand = replconf_resp[1].serialize_to_list_of_strings(false)[0].clone();
+                        let ok_response = RespData::SimpleString("OK".to_string());
+                        stream.write_all(ok_response.serialize_to_redis_protocol().as_bytes()).await?;
+//                         if subcommand == "ack" {
+//                             stream.write_all("+OK\r\n".as_bytes()).await?;
+//                         } else {
+//                             stream.write_all("-ERR unknown subcommand\r\n".as_bytes()).await?;
+//                         }
+                    }
                     _ => {
                         stream
                             .write_all("-ERR unknown command\r\n".as_bytes())
