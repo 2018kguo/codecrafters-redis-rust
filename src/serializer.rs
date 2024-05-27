@@ -56,52 +56,9 @@ pub fn parse_resp_data(bytes: &[u8]) -> Result<(RespData, usize)> {
         '$' => parse_bulk_string(bytes),
         '*' => parse_array(bytes),
         '+' => parse_simple_string(bytes),
-        '\0' => {
-            // Discard all null bytes until the next non-null byte
-            // and then call parse_resp_data again
-            //println!("Null byte found in parse_resp_data");
-            //println!("{:?}", bytes);
-            let mut index = 1;
-            while bytes[index] == 0 {
-                index += 1;
-            }
-            //println!("{:?}", &bytes[index..]);
-            let (resp_data, bytes_parsed) = parse_resp_data(&bytes[index..])?;
-            Ok((resp_data, index + bytes_parsed))
-        }
         _ => {
             println!("Failed to parse {:?}", bytes);
             return Err(anyhow::anyhow!("Failed to parse"));
-        }
-    }
-}
-
-pub fn parse_resp_data_stupid(bytes: &[u8]) -> Result<(RespData, usize)> {
-    match bytes[0] as char {
-        '$' => parse_bulk_string(bytes),
-        '*' => parse_array(bytes),
-        '+' => parse_simple_string(bytes),
-        '\0' => {
-            // Discard all null bytes until the next non-null byte
-            // and then call parse_resp_data again
-            //println!("Null byte found in parse_resp_data");
-            //println!("{:?}", bytes);
-            let mut index = 1;
-            while bytes[index] == 0 {
-                index += 1;
-            }
-            //println!("{:?}", &bytes[index..]);
-            let (resp_data, bytes_parsed) = parse_resp_data_stupid(&bytes[index..])?;
-            Ok((resp_data, index + bytes_parsed))
-        }
-        _ => {
-            // find the next null byte
-            let mut index = 1;
-            while bytes[index] != 0 {
-                index += 1;
-            }
-            let (resp_data, bytes_parsed) = parse_resp_data_stupid(&bytes[index..])?;
-            Ok((resp_data, index + bytes_parsed))
         }
     }
 }
@@ -247,27 +204,6 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_rdb_file_with_null_byte_padding() {
-        let bytes = [
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 36, 56, 56, 13, 10, 82, 69, 68, 73, 83, 48, 48, 49, 49, 250, 9,
-            114, 101, 100, 105, 115, 45, 118, 101, 114, 5, 55, 46, 50, 46, 48, 250, 10, 114, 101,
-            100, 105, 115, 45, 98, 105, 116, 115, 192, 64, 250, 5, 99, 116, 105, 109, 101, 194,
-            109, 8, 188, 101, 250, 8, 117, 115, 101, 100, 45, 109, 101, 109, 194, 176, 196, 16, 0,
-            250, 8, 97, 111, 102, 45, 98, 97, 115, 101, 192, 0, 255, 240, 110, 59, 254, 192, 255,
-            90, 162, 0, 0, 0,
-        ];
-        assert_eq!(bytes.len(), 133);
-        let (resp_data, bytes_read) = parse_resp_data(&bytes).unwrap();
-        // bytes_read includes the 36 null bytes at the start of the array
-        assert_eq!(bytes_read, 130);
-        assert_eq!(
-            resp_data,
-            RespData::BulkString("__REDIS_RDB_FILE".to_string())
-        );
-    }
-
-    #[test]
     fn test_handle_bulk_string_after_simple_string() {
         let bytes = [
             43, 70, 85, 76, 76, 82, 69, 83, 89, 78, 67, 32, 55, 53, 99, 100, 55, 98, 99, 49, 48,
@@ -303,18 +239,6 @@ mod tests {
             5, 99, 116, 105, 109, 101, 194, 109, 8, 188, 101, 250, 8, 117, 115, 101, 100, 45, 109,
             101, 109, 194, 176, 196, 16, 0, 250, 8, 97, 111, 102, 45, 98, 97, 115, 101, 192, 0,
             255, 240, 110, 59, 254, 192, 255, 90, 162, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         let (resp_data, bytes_read) = parse_resp_data(&bytes).unwrap();
         assert_eq!(
@@ -330,16 +254,5 @@ mod tests {
         );
         // assert that the leftover bytes are all null bytes
         assert!(bytes[bytes_read + bytes_read_2..].iter().all(|&x| x == 0));
-    }
-
-    #[test]
-    fn test_asdf() {
-        let bytes = [
-            42, 51, 13, 10, 36, 56, 13, 10, 82, 69, 80, 76, 67, 79, 78, 70, 13, 10, 36, 52, 13, 10,
-            99, 97, 112, 97, 13, 10, 36, 54, 13, 10, 112, 115, 121, 110, 99, 50, 13, 10, 52, 13,
-            10, 54, 51, 56, 48, 13, 10,
-        ];
-        let (resp_data, bytes_read) = parse_resp_data(&bytes).unwrap();
-        assert_eq!(bytes_read, bytes.len());
     }
 }
