@@ -25,6 +25,8 @@ struct ServerInfo {
     // All other propagated commands (like PING, SET etc.) should be read and processed, but a response should not be sent back to the master.
     handshake_with_master_complete: bool,
     num_command_bytes_processed_as_replica: usize,
+    // For counting purposes we treat this as the number of replicas that have finished the handshake
+    num_connected_replicas: usize,
 }
 
 #[tokio::main]
@@ -67,6 +69,7 @@ async fn main() -> Result<()> {
         master_repl_offset,
         handshake_with_master_complete: false,
         num_command_bytes_processed_as_replica: 0,
+        num_connected_replicas: 0,
     }));
 
     let listener = TcpListener::bind(sock).await?;
@@ -289,8 +292,20 @@ async fn read_and_handle_single_command_from_local_buffer(
                 &resp,
                 master_replid,
                 master_repl_offset,
+                server_info.clone(),
             )
             .await?;
+        }
+        "wait" => {
+            // Just respond with 0 (as a RESP Integer) for now. In the test there are no connected replicas
+            let num_connected_replicas = {
+                let server_info = server_info.lock().await;
+                server_info.num_connected_replicas
+            };
+            let integer_resp = RespData::Integer(num_connected_replicas as isize);
+            stream
+                .write_all(integer_resp.serialize_to_redis_protocol().as_bytes())
+                .await?;
         }
         _ => {
             println!("Unknown command");
@@ -518,6 +533,7 @@ async fn handle_psync_command(
     resp: &RespData,
     master_replid: String,
     master_repl_offset: usize,
+    server_info: Arc<Mutex<ServerInfo>>,
 ) -> Result<()> {
     let psync_resp = RespData::unpack_array(resp);
     let _replication_id = psync_resp[1].serialize_to_list_of_strings(false)[0].clone();
@@ -536,6 +552,11 @@ async fn handle_psync_command(
         .await?;
     stream.flush().await?;
 
+    // increment the number of connected replicas
+    {
+        let mut server_info = server_info.lock().await;
+        server_info.num_connected_replicas += 1;
+    }
     // lastly, send an empty RDB file back to the replica
     let hardcoded_empty_rdb_file_hex = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
     let binary_empty_rdb = utils::decode_hex_string(hardcoded_empty_rdb_file_hex)?;

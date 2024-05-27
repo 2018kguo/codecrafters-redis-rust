@@ -5,6 +5,7 @@ pub enum RespData {
     SimpleString(String),
     BulkString(String),
     Array(Vec<RespData>),
+    Integer(isize),
 }
 
 impl RespData {
@@ -21,6 +22,7 @@ impl RespData {
                 }
                 serialized_data
             }
+            RespData::Integer(data) => format!(":{}\r\n", data),
         }
     }
 
@@ -35,6 +37,7 @@ impl RespData {
                 }
                 serialized_data
             }
+            RespData::Integer(data) => vec![data.to_string()],
         };
         if lowercase {
             string_vec.iter().map(|s| s.to_lowercase()).collect()
@@ -56,11 +59,21 @@ pub fn parse_resp_data(bytes: &[u8]) -> Result<(RespData, usize)> {
         '$' => parse_bulk_string(bytes),
         '*' => parse_array(bytes),
         '+' => parse_simple_string(bytes),
+        ':' => parse_integer(bytes),
         _ => {
             println!("Failed to parse {:?}", bytes);
             Err(anyhow::anyhow!("Failed to parse"))
         }
     }
+}
+
+fn parse_integer(bytes: &[u8]) -> Result<(RespData, usize)> {
+    let (data, bytes_read) = read_until_crlf(&bytes[1..]).context("Failed to read until CRLF")?;
+    let data = std::str::from_utf8(data).context("Failed to parse data")?;
+    Ok((
+        RespData::Integer(data.parse::<isize>().context("Failed to parse integer")?),
+        bytes_read + 1,
+    ))
 }
 
 fn parse_bulk_string(bytes: &[u8]) -> Result<(RespData, usize)> {
@@ -254,5 +267,21 @@ mod tests {
         );
         // assert that the leftover bytes are all null bytes
         assert!(bytes[bytes_read + bytes_read_2..].iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn test_parse_integer() {
+        let bytes = b":1000\r\n";
+        let (resp_data, bytes_read) = parse_integer(bytes).unwrap();
+        assert_eq!(bytes_read, 7);
+        assert_eq!(resp_data, RespData::Integer(1000));
+    }
+
+    #[test]
+    fn test_parse_negative_integer() {
+        let bytes = b":-1000\r\n";
+        let (resp_data, bytes_read) = parse_integer(bytes).unwrap();
+        assert_eq!(bytes_read, 8);
+        assert_eq!(resp_data, RespData::Integer(-1000));
     }
 }
