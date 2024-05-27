@@ -1,9 +1,7 @@
 use anyhow::Result;
 use serializer::{parse_resp_data, RespData};
-use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::env;
-use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::time;
 use time::{Duration, Instant};
@@ -12,6 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::Sender;
 use tokio::sync::{broadcast, Mutex};
 mod serializer;
+mod utils;
 
 struct StoredValue {
     value: String,
@@ -40,7 +39,7 @@ async fn main() -> Result<()> {
     }
 
     // generate 40 character long random string for the master_replid
-    let master_replid: String = get_random_string(40);
+    let master_replid: String = utils::get_random_string(40);
     let master_repl_offset = 0;
 
     let sock = format!("127.0.0.1:{}", port_to_use);
@@ -70,6 +69,12 @@ async fn main() -> Result<()> {
     let storage_listener_clone = Arc::clone(&storage);
     let server_info_listener_clone = Arc::clone(&server_info);
 
+    // !! In terms of control flow, we need the listener loop to run ASAP and we then optionally
+    // !! perform the replica handshake. If this isn't respected then you run into situations where
+    // !! one end of the connection isn't ready to accept incoming connections in time.
+    // !! I haven't figured out a way to avoid this race condition other than doing this if/else
+    // !! where if we're a master than we immediatelly enter the listener loop in a blocking manner
+    // !! without waiting for tokio to spawn and execute loop in a green thread.
     if role == "slave" {
         let listener_task = tokio::spawn(async move {
             println!("Listening");
@@ -129,11 +134,9 @@ async fn handle_connection(
 ) -> Result<()> {
     // Primer on sockets: https://docs.python.org/3/howto/sockets.html
     let mut buf = [0; 512];
-    let mut accumulated_data = Vec::new();
+    let mut local_buffer = Vec::new();
 
-    println!("ASDF");
     loop {
-        println!("LOOPING IN MASTER");
         match stream.read(&mut buf).await {
             Ok(0) => {
                 println!("Connection closed");
@@ -141,161 +144,13 @@ async fn handle_connection(
                 return Ok(());
             }
             Ok(n) => {
-                // process_accumulated_data(
-                //     &mut stream,
-                //     &mut accumulated_data,
-                //     storage.clone(),
-                //     server_info.clone(),
-                //     sender.clone(),
-
-                // ).await?;
-                println!("Bytes read: {}", n);
-                accumulated_data.extend_from_slice(&buf[..n]);
-                println!("Accumulated data: {:?}", accumulated_data);
-                let parse_result = parse_resp_data(&accumulated_data);
-                let (resp, bytes_read) = parse_result?;
-                accumulated_data = accumulated_data[bytes_read..].to_vec();
-                let commands_list = resp.serialize_to_list_of_strings(true);
-                println!("OOGA BOOGA ON MASTER: {:?}", commands_list);
-                match commands_list[0].as_str() {
-                    "echo" => {
-                        let echo_resp = RespData::unpack_array(&resp);
-                        let serialized_resp = echo_resp[1].serialize_to_redis_protocol();
-                        stream.write_all(serialized_resp.as_bytes()).await?;
-                    }
-                    "ping" => {
-                        println!("Received PING command");
-                        stream.write_all("+PONG\r\n".as_bytes()).await?;
-                        println!("Sent PONG response");
-                    }
-                    "set" => {
-                        println!("Received SET command");
-                        handle_set_command(
-                            &mut stream,
-                            storage.clone(),
-                            sender.clone(),
-                            &buf,
-                            bytes_read,
-                            resp,
-                            false,
-                        )
-                        .await?;
-                        println!("Finished SET command");
-                    }
-                    "get" => {
-                        println!("Received GET command");
-                        handle_get_command(&mut stream, storage.clone(), &resp).await?;
-                    }
-                    "info" => {
-                        println!("Received INFO command");
-                        // ex: redis-cli INFO replication
-                        // still need to actually parse the argument but this works for now
-                        let server_info = server_info.lock().await;
-                        let role = &server_info.role;
-
-                        let replication_info = format!(
-                            "role:{}\nmaster_replid:{}\nmaster_repl_offset:{}",
-                            role, server_info.master_replid, server_info.master_repl_offset
-                        );
-                        let info_resp_response = RespData::BulkString(replication_info);
-                        stream
-                            .write_all(info_resp_response.serialize_to_redis_protocol().as_bytes())
-                            .await?;
-                    }
-                    "replconf" => {
-                        let replconf_resp = RespData::unpack_array(&resp);
-                        let _subcommand =
-                            replconf_resp[1].serialize_to_list_of_strings(false)[0].clone();
-                        let ok_response = RespData::SimpleString("OK".to_string());
-                        stream
-                            .write_all(ok_response.serialize_to_redis_protocol().as_bytes())
-                            .await?;
-                    }
-                    "psync" => {
-                        println!("Received PSYNC command");
-                        handle_psync_command(
-                            &mut stream,
-                            server_info.clone(),
-                            sender.clone(),
-                            &resp,
-                        )
-                        .await?;
-                    }
-                    "fullresync" => {
-                        // fullresync is only sent by the master to the replica
-                        // so we don't need to handle it here
-                        //println!("Received FULLRESYNC command");
-                    }
-                    _ => {
-                        println!("Unknown command");
-                        let role = {
-                            let server_info = server_info.lock().await;
-                            server_info.role.clone()
-                        };
-                        // slaves receive the FULLRESYNC command from the master
-                        // as well as the RDB file which we don't want to respond to with an error
-                        // so just ignore unknown commands for slaves for now
-                        //println!("Role: {}", role);
-                        if role == "master" {
-                            //println!("Unknown command");
-                            stream
-                                .write_all("-ERR unknown command\r\n".as_bytes())
-                                .await?;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                println!("Error reading from socket: {}", e);
-                return Err(e.into());
-            }
-        }
-    }
-}
-
-async fn process_commands_from_buffer(
-    mut stream: TcpStream,
-    storage: Arc<Mutex<HashMap<String, StoredValue>>>,
-    server_info: Arc<Mutex<ServerInfo>>,
-    sender: Arc<Sender<Vec<u8>>>,
-) -> Result<()> {
-    // Primer on sockets: https://docs.python.org/3/howto/sockets.html
-    let mut buf = [0; 512];
-    let mut accumulated_data = Vec::new();
-
-    loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => {
-                println!("Connection closed");
-                // 0 bytes read so connection is closed
-                process_accumulated_data(
+                local_buffer.extend_from_slice(&buf[..n]);
+                process_local_buffer(
                     &mut stream,
-                    &mut accumulated_data,
-                    storage,
-                    server_info,
-                    sender,
-                    true,
-                )
-                .await?;
-                return Ok(());
-            }
-            Ok(n) => {
-                println!(
-                    "accumulated_data BEFORE reading in more stuff {:?}",
-                    accumulated_data
-                );
-                accumulated_data.extend_from_slice(&buf[..n]);
-                //println!(
-                //    "accumulated_data AFTER reading in from the stream {:?}",
-                //    accumulated_data
-                //);
-                process_accumulated_data(
-                    &mut stream,
-                    &mut accumulated_data,
+                    &mut local_buffer,
                     storage.clone(),
                     server_info.clone(),
                     sender.clone(),
-                    true,
                 )
                 .await?;
             }
@@ -307,112 +162,138 @@ async fn process_commands_from_buffer(
     }
 }
 
-async fn process_accumulated_data(
-    stream: &mut tokio::net::TcpStream,
-    accumulated_data: &mut Vec<u8>,
+async fn read_and_handle_single_command_from_local_buffer(
+    stream: &mut TcpStream,
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
     server_info: Arc<Mutex<ServerInfo>>,
     sender: Arc<Sender<Vec<u8>>>,
-    is_replica: bool,
+    local_buffer: &mut Vec<u8>,
 ) -> Result<()> {
+    let role = {
+        let server_info = server_info.lock().await;
+        server_info.role.clone()
+    };
+    let is_replica = role == "slave";
+    let (resp, bytes_read) = parse_resp_data(local_buffer)?;
+
+    // pop the bytes that we've already read for this message from our local buffer
+    let message_bytes = local_buffer[..bytes_read].to_vec();
+    *local_buffer = local_buffer[bytes_read..].to_vec();
+
+    let commands_list = resp.serialize_to_list_of_strings(true);
+    match commands_list[0].as_str() {
+        "echo" => {
+            let echo_resp = RespData::unpack_array(&resp);
+            let serialized_resp = echo_resp[1].serialize_to_redis_protocol();
+            stream.write_all(serialized_resp.as_bytes()).await?;
+        }
+        "ping" => {
+            stream.write_all("+PONG\r\n".as_bytes()).await?;
+        }
+        "set" => {
+            handle_set_command(
+                stream,
+                storage.clone(),
+                sender.clone(),
+                &message_bytes,
+                resp,
+                is_replica,
+            )
+            .await?;
+        }
+        "get" => {
+            handle_get_command(stream, storage.clone(), &resp).await?;
+        }
+        "info" => {
+            // ex: redis-cli INFO replication
+            // still need to actually parse the argument but this works for now
+            let server_info = server_info.lock().await;
+            let replication_info = format!(
+                "role:{}\nmaster_replid:{}\nmaster_repl_offset:{}",
+                role, server_info.master_replid, server_info.master_repl_offset
+            );
+            let info_resp_response = RespData::BulkString(replication_info);
+            stream
+                .write_all(info_resp_response.serialize_to_redis_protocol().as_bytes())
+                .await?;
+        }
+        "replconf" => {
+            if is_replica {
+                return Err(anyhow::anyhow!(
+                    "REPLCONF command not expected for replicas"
+                ));
+            }
+            let replconf_resp = RespData::unpack_array(&resp);
+            let _subcommand = replconf_resp[1].serialize_to_list_of_strings(false)[0].clone();
+            let ok_response = RespData::SimpleString("OK".to_string());
+            stream
+                .write_all(ok_response.serialize_to_redis_protocol().as_bytes())
+                .await?;
+        }
+        "psync" => {
+            if is_replica {
+                return Err(anyhow::anyhow!("PSYNC command not expected for replicas"));
+            }
+            let (master_replid, master_repl_offset) = {
+                let server_info = server_info.lock().await;
+                (
+                    server_info.master_replid.clone(),
+                    server_info.master_repl_offset,
+                )
+            };
+            // This spawns a loop where we will keep reading from the replica command receiver
+            // and forwarding the commands to the replica that we're currently replying to.
+            // We need to make sure we aren't holding any locks before entering this loop
+            // because that will limit us to only being able to handle 1 replica at a time
+            // since the other replicas will be forever blocked on acquiring the lock.
+            handle_psync_command(
+                stream,
+                sender.clone(),
+                &resp,
+                master_replid,
+                master_repl_offset,
+            )
+            .await?;
+        }
+        _ => {
+            println!("Unknown command");
+            // slaves receive the FULLRESYNC command from the master
+            // as well as the RDB file which we don't want to respond to with an error
+            // so just ignore unknown commands for slaves for now
+            if role == "master" {
+                stream
+                    .write_all("-ERR unknown command\r\n".as_bytes())
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn process_local_buffer(
+    stream: &mut tokio::net::TcpStream,
+    local_buffer: &mut Vec<u8>,
+    storage: Arc<Mutex<HashMap<String, StoredValue>>>,
+    server_info: Arc<Mutex<ServerInfo>>,
+    sender: Arc<Sender<Vec<u8>>>,
+) -> Result<()> {
+    // Multiple commands can get fetched in a single read from the TCP stream, so we need to make sure
+    // we handle all of the messages inside our local buffer because otherwise we'll only process 1 command
+    // per read and the rest will be left in the buffer.
     loop {
-        // if accumulated_data is purely null bytes, end the loop
-        if accumulated_data.iter().all(|&x| x == 0) {
-            accumulated_data.clear();
+        // if local_buffer is purely null bytes, end the loop
+        if local_buffer.iter().all(|&x| x == 0) {
+            local_buffer.clear();
             return Ok(());
         }
-        let parse_result = parse_resp_data(&accumulated_data)?;
-        let (resp, bytes_read) = parse_result;
-        *accumulated_data = accumulated_data[bytes_read..].to_vec();
-        let commands_list = resp.serialize_to_list_of_strings(true);
-        println!("OOGA BOOGA ON REPLICA: {:?}", commands_list);
-        match commands_list[0].as_str() {
-            "echo" => {
-                let echo_resp = RespData::unpack_array(&resp);
-                let serialized_resp = echo_resp[1].serialize_to_redis_protocol();
-                stream.write_all(serialized_resp.as_bytes()).await?;
-            }
-            "ping" => {
-                stream.write_all("+PONG\r\n".as_bytes()).await?;
-            }
-            "set" => {
-                handle_set_command(
-                    stream,
-                    storage.clone(),
-                    sender.clone(),
-                    &accumulated_data,
-                    bytes_read,
-                    resp,
-                    is_replica,
-                )
-                .await?;
-            }
-            "get" => {
-                //println!("Received GET command");
-                handle_get_command(stream, storage.clone(), &resp).await?;
-            }
-            "info" => {
-                // ex: redis-cli INFO replication
-                // still need to actually parse the argument but this works for now
-                let server_info = server_info.lock().await;
-                let role = &server_info.role;
-
-                let replication_info = format!(
-                    "role:{}\nmaster_replid:{}\nmaster_repl_offset:{}",
-                    role, server_info.master_replid, server_info.master_repl_offset
-                );
-                let info_resp_response = RespData::BulkString(replication_info);
-                stream
-                    .write_all(info_resp_response.serialize_to_redis_protocol().as_bytes())
-                    .await?;
-            }
-            "replconf" => {
-                let replconf_resp = RespData::unpack_array(&resp);
-                let _subcommand = replconf_resp[1].serialize_to_list_of_strings(false)[0].clone();
-                let ok_response = RespData::SimpleString("OK".to_string());
-                stream
-                    .write_all(ok_response.serialize_to_redis_protocol().as_bytes())
-                    .await?;
-            }
-            "psync" => {
-                //println!("Received PSYNC command");
-                if !is_replica {
-                    handle_psync_command(stream, server_info.clone(), sender.clone(), &resp)
-                        .await?;
-                }
-            }
-            "__redis_rdb_file" => {
-                // response with OK
-                let ok_response = RespData::SimpleString("OK".to_string());
-                stream
-                    .write_all(ok_response.serialize_to_redis_protocol().as_bytes())
-                    .await?;
-            }
-            _ => {
-                if commands_list[0].starts_with("fullresync") {
-                    // fullresync is only sent by the master to the replica
-                    // so we don't need to handle it here
-                    //println!("Received FULLRESYNC command");
-                    let ok_response = RespData::SimpleString("OK".to_string());
-                    stream
-                        .write_all(ok_response.serialize_to_redis_protocol().as_bytes())
-                        .await?;
-                }
-                let role = {
-                    let server_info = server_info.lock().await;
-                    server_info.role.clone()
-                };
-                // slaves receive the FULLRESYNC command from the master
-                // as well as the RDB file which we don't want to respond to with an error
-                // so just ignore unknown commands for slaves for now
-                if role == "master" {
-                    //println!("Unknown command");
-                    stream
-                        .write_all("-ERR unknown command\r\n".as_bytes())
-                        .await?;
-                }
-            }
-        }
+        read_and_handle_single_command_from_local_buffer(
+            stream,
+            storage.clone(),
+            server_info.clone(),
+            sender.clone(),
+            local_buffer,
+        )
+        .await?;
     }
 }
 
@@ -486,7 +367,12 @@ async fn perform_replica_master_handshake(
         .write_all(psync_command.serialize_to_redis_protocol().as_bytes())
         .await?;
     stream.flush().await?;
-    process_commands_from_buffer(stream, storage, server_info, sender).await?;
+
+    // We need to handle commands sent back on the same outgoing TCP connection from the stream to the master.
+    // This traffic isn't directed to the main listener loop, so we need to handle it here.
+    // We expect to receive a FULLRESYNC command from the master followed by an RDB file, and then potentially
+    // more commands.
+    handle_connection(stream, storage, server_info, sender).await?;
     Ok(())
 }
 
@@ -510,11 +396,10 @@ async fn handle_get_command(
         }
         // Key has either expired or never existed in the map.
         _ => {
-            //println!("Key not found");
+            println!("Key not found");
             stream.write_all("$-1\r\n".as_bytes()).await?;
         }
     }
-    //println!("DONE WITH GET");
     Ok(())
 }
 
@@ -522,8 +407,7 @@ async fn handle_set_command(
     stream: &mut TcpStream,
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
     sender: Arc<Sender<Vec<u8>>>,
-    buf: &[u8],
-    bytes_read: usize,
+    message_bytes: &[u8],
     resp: RespData,
     is_replica: bool,
 ) -> Result<()> {
@@ -571,74 +455,43 @@ async fn handle_set_command(
     // We can't directly send the contents of our own buffer because it will contain a bunch of
     // null byte padding at the end. Instead, we need to send the exact bytes
     // that we actually read to construct the message
-    //if !is_replica {
-    //    let buf_up_to_bytes_read = &buf[..bytes_read];
-    //    sender.send(buf_up_to_bytes_read.to_vec())?;
-    //}
-
     if !is_replica {
-        let buf_up_to_bytes_read = &buf[..bytes_read];
-        // trim nulls from the start and end of the buffer
-        let mut start_index = 0;
-        for i in 0..buf_up_to_bytes_read.len() {
-            if buf_up_to_bytes_read[i] != 0 {
-                start_index = i;
-                break;
-            }
-        }
-        let mut end_index = buf_up_to_bytes_read.len();
-        for i in (0..buf_up_to_bytes_read.len()).rev() {
-            if buf_up_to_bytes_read[i] != 0 {
-                end_index = i + 1;
-                break;
-            }
-        }
-        let buf_up_to_bytes_read_trimmed = &buf_up_to_bytes_read[start_index..end_index];
-        sender.send(buf_up_to_bytes_read_trimmed.to_vec())?;
+        sender.send(message_bytes.to_vec())?;
     }
     Ok(())
 }
 
 async fn handle_psync_command(
     stream: &mut TcpStream,
-    server_info: Arc<Mutex<ServerInfo>>,
     sender: Arc<Sender<Vec<u8>>>,
     resp: &RespData,
+    master_replid: String,
+    master_repl_offset: usize,
 ) -> Result<()> {
     let psync_resp = RespData::unpack_array(resp);
     let _replication_id = psync_resp[1].serialize_to_list_of_strings(false)[0].clone();
     let _offset = psync_resp[2].serialize_to_list_of_strings(false)[0].clone();
 
-    // !! VERY IMPORTANT !!
-    // Make sure that the lock on the server_info is released before entering the receiver loop
-    // because otherwise the lock on server_info will be indefinitely held by this replica green
-    // thread and no other replicas will be able to connect to the server since they will try
-    // to acquire the lock on server_info as well
-    {
-        // Respond with +FULLRESYNC <replid> <offset>
-        let server_info = server_info.lock().await;
-        let full_resync_response = RespData::SimpleString(format!(
-            "+FULLRESYNC {} {}",
-            server_info.master_replid, server_info.master_repl_offset
-        ));
-        stream
-            .write_all(
-                full_resync_response
-                    .serialize_to_redis_protocol()
-                    .as_bytes(),
-            )
-            .await?;
-        stream.flush().await?;
-    }
+    let full_resync_response = RespData::SimpleString(format!(
+        "+FULLRESYNC {} {}",
+        master_replid, master_repl_offset
+    ));
+    stream
+        .write_all(
+            full_resync_response
+                .serialize_to_redis_protocol()
+                .as_bytes(),
+        )
+        .await?;
+    stream.flush().await?;
 
     // lastly, send an empty RDB file back to the replica
     let hardcoded_empty_rdb_file_hex = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
-    let binary_empty_rdb = decode_hex_string(hardcoded_empty_rdb_file_hex)?;
+    let binary_empty_rdb = utils::decode_hex_string(hardcoded_empty_rdb_file_hex)?;
     let len = binary_empty_rdb.len();
     stream.write_all(format!("${}\r\n", len).as_bytes()).await?;
     stream.write_all(&binary_empty_rdb).await?;
     // create a new receiver for the replica command channel
-    println!("LOOPING");
     let mut replica_rx = sender.subscribe();
     loop {
         let replica_command = replica_rx.recv().await?;
@@ -647,29 +500,4 @@ async fn handle_psync_command(
         // make sure messages are sent to the replica immediately
         stream.flush().await?;
     }
-}
-
-fn get_random_string(len: usize) -> String {
-    let mut random_string = String::new();
-    for _ in 0..len {
-        let random_value = RandomState::new().build_hasher().finish() as usize;
-        random_string.push_str(&random_value.to_string());
-    }
-    random_string
-}
-
-fn decode_hex_string(hex: &str) -> Result<Vec<u8>> {
-    if hex.len() % 2 != 0 {
-        return Err(anyhow::anyhow!("Invalid hex string length"));
-    }
-
-    let mut binary_data = Vec::new();
-
-    for i in (0..hex.len()).step_by(2) {
-        let byte_str = &hex[i..i + 2];
-        let byte = u8::from_str_radix(byte_str, 16)?;
-        binary_data.push(byte);
-    }
-
-    Ok(binary_data)
 }

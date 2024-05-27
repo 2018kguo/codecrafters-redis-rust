@@ -58,7 +58,7 @@ pub fn parse_resp_data(bytes: &[u8]) -> Result<(RespData, usize)> {
         '+' => parse_simple_string(bytes),
         _ => {
             println!("Failed to parse {:?}", bytes);
-            return Err(anyhow::anyhow!("Failed to parse"));
+            Err(anyhow::anyhow!("Failed to parse"))
         }
     }
 }
@@ -73,6 +73,7 @@ fn parse_bulk_string(bytes: &[u8]) -> Result<(RespData, usize)> {
     // add 1 to account for the leading $ character
     let start_of_bulk_string_index = 1 + bytes_read;
     let end_of_bulk_string_index = 1 + bytes_read + len;
+
     // check if this is a bulk string for an RDB file, in which base the starting 5 bytes after the length will be the string "REDIS"
     // and FF (255 in decimal) will be towards the end of the string.
     // if it is, we return a dummy BulkString with the string "REDIS" and the length of the string
@@ -116,7 +117,6 @@ fn parse_array(_bytes: &[u8]) -> Result<(RespData, usize)> {
         .context("Failed to parse length")?
         .parse::<usize>()
         .context("Failed to parse length")?;
-    println!("Array length: {}", len);
     // add 1 to account for the leading * character
     let mut index = 1 + bytes_read;
     let mut array_resp: Vec<RespData> = Vec::new();
