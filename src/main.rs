@@ -21,6 +21,9 @@ struct ServerInfo {
     role: String,
     master_replid: String,
     master_repl_offset: usize,
+    // After the master-replica handshake is complete, a replica should only send responses to REPLCONF GETACK commands.
+    // All other propagated commands (like PING, SET etc.) should be read and processed, but a response should not be sent back to the master.
+    handshake_with_master_complete: bool,
 }
 
 #[tokio::main]
@@ -61,6 +64,7 @@ async fn main() -> Result<()> {
         role: role.to_string(),
         master_replid,
         master_repl_offset,
+        handshake_with_master_complete: false,
     }));
 
     let listener = TcpListener::bind(sock).await?;
@@ -169,9 +173,14 @@ async fn read_and_handle_single_command_from_local_buffer(
     sender: Arc<Sender<Vec<u8>>>,
     local_buffer: &mut Vec<u8>,
 ) -> Result<()> {
-    let role = {
+    let (role, master_replid, master_repl_offset, handshake_with_master_complete) = {
         let server_info = server_info.lock().await;
-        server_info.role.clone()
+        (
+            server_info.role.clone(),
+            server_info.master_replid.clone(),
+            server_info.master_repl_offset.clone(),
+            server_info.handshake_with_master_complete.clone(),
+        )
     };
     let is_replica = role == "slave";
     let (resp, bytes_read) = parse_resp_data(local_buffer)?;
@@ -188,7 +197,9 @@ async fn read_and_handle_single_command_from_local_buffer(
             stream.write_all(serialized_resp.as_bytes()).await?;
         }
         "ping" => {
-            stream.write_all("+PONG\r\n".as_bytes()).await?;
+            if !handshake_with_master_complete {
+                stream.write_all("+PONG\r\n".as_bytes()).await?;
+            }
         }
         "set" => {
             handle_set_command(
@@ -198,6 +209,7 @@ async fn read_and_handle_single_command_from_local_buffer(
                 &message_bytes,
                 resp,
                 is_replica,
+                handshake_with_master_complete,
             )
             .await?;
         }
@@ -218,29 +230,33 @@ async fn read_and_handle_single_command_from_local_buffer(
                 .await?;
         }
         "replconf" => {
-            if is_replica {
-                return Err(anyhow::anyhow!(
-                    "REPLCONF command not expected for replicas"
-                ));
-            }
             let replconf_resp = RespData::unpack_array(&resp);
             let _subcommand = replconf_resp[1].serialize_to_list_of_strings(false)[0].clone();
-            let ok_response = RespData::SimpleString("OK".to_string());
-            stream
-                .write_all(ok_response.serialize_to_redis_protocol().as_bytes())
-                .await?;
+            if _subcommand.to_lowercase() == "getack" {
+                // i.ie REPLCONF GETACK *
+                if !is_replica {
+                    return Err(anyhow::anyhow!("GETACK command not expected for masters"));
+                }
+                // for now just respond with REPLCONF ACK 0 as a RESP Array of bulk strings
+                let ack_response = RespData::Array(vec![
+                    RespData::BulkString("REPLCONF".to_string()),
+                    RespData::BulkString("ACK".to_string()),
+                    RespData::BulkString("0".to_string()),
+                ]);
+                stream
+                    .write_all(ack_response.serialize_to_redis_protocol().as_bytes())
+                    .await?;
+            } else {
+                let ok_response = RespData::SimpleString("OK".to_string());
+                stream
+                    .write_all(ok_response.serialize_to_redis_protocol().as_bytes())
+                    .await?;
+            }
         }
         "psync" => {
             if is_replica {
                 return Err(anyhow::anyhow!("PSYNC command not expected for replicas"));
             }
-            let (master_replid, master_repl_offset) = {
-                let server_info = server_info.lock().await;
-                (
-                    server_info.master_replid.clone(),
-                    server_info.master_repl_offset,
-                )
-            };
             // This spawns a loop where we will keep reading from the replica command receiver
             // and forwarding the commands to the replica that we're currently replying to.
             // We need to make sure we aren't holding any locks before entering this loop
@@ -367,6 +383,11 @@ async fn perform_replica_master_handshake(
         .write_all(psync_command.serialize_to_redis_protocol().as_bytes())
         .await?;
     stream.flush().await?;
+    // set the handshake_with_master_complete flag to true
+    {
+        let mut server_info = server_info.lock().await;
+        server_info.handshake_with_master_complete = true;
+    }
 
     // We need to handle commands sent back on the same outgoing TCP connection from the stream to the master.
     // This traffic isn't directed to the main listener loop, so we need to handle it here.
@@ -410,6 +431,7 @@ async fn handle_set_command(
     message_bytes: &[u8],
     resp: RespData,
     is_replica: bool,
+    handshake_with_master_complete: bool,
 ) -> Result<()> {
     let set_resp = RespData::unpack_array(&resp);
     // the second element in the array is the key
@@ -446,7 +468,9 @@ async fn handle_set_command(
         );
     }
     // return OK as a simple string
-    stream.write_all("+OK\r\n".as_bytes()).await?;
+    if !handshake_with_master_complete {
+        stream.write_all("+OK\r\n".as_bytes()).await?;
+    }
     // send the same bytes that we read for this command to all of the
     // connected replicas. Since the replicas run the same code they will
     // parse the command the same way so we don't need to re-serialize the
