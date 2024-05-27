@@ -24,6 +24,7 @@ struct ServerInfo {
     // After the master-replica handshake is complete, a replica should only send responses to REPLCONF GETACK commands.
     // All other propagated commands (like PING, SET etc.) should be read and processed, but a response should not be sent back to the master.
     handshake_with_master_complete: bool,
+    num_command_bytes_processed_as_replica: usize,
 }
 
 #[tokio::main]
@@ -65,6 +66,7 @@ async fn main() -> Result<()> {
         master_replid,
         master_repl_offset,
         handshake_with_master_complete: false,
+        num_command_bytes_processed_as_replica: 0,
     }));
 
     let listener = TcpListener::bind(sock).await?;
@@ -173,13 +175,20 @@ async fn read_and_handle_single_command_from_local_buffer(
     sender: Arc<Sender<Vec<u8>>>,
     local_buffer: &mut Vec<u8>,
 ) -> Result<()> {
-    let (role, master_replid, master_repl_offset, handshake_with_master_complete) = {
+    let (
+        role,
+        master_replid,
+        master_repl_offset,
+        handshake_with_master_complete,
+        num_command_bytes_processed_as_replica,
+    ) = {
         let server_info = server_info.lock().await;
         (
             server_info.role.clone(),
             server_info.master_replid.clone(),
-            server_info.master_repl_offset.clone(),
-            server_info.handshake_with_master_complete.clone(),
+            server_info.master_repl_offset,
+            server_info.handshake_with_master_complete,
+            server_info.num_command_bytes_processed_as_replica,
         )
     };
     let is_replica = role == "slave";
@@ -197,6 +206,11 @@ async fn read_and_handle_single_command_from_local_buffer(
             stream.write_all(serialized_resp.as_bytes()).await?;
         }
         "ping" => {
+            // increment the number of command bytes processed as a replica
+            if is_replica {
+                let mut server_info = server_info.lock().await;
+                server_info.num_command_bytes_processed_as_replica += bytes_read;
+            }
             if !handshake_with_master_complete {
                 stream.write_all("+PONG\r\n".as_bytes()).await?;
             }
@@ -210,6 +224,7 @@ async fn read_and_handle_single_command_from_local_buffer(
                 resp,
                 is_replica,
                 handshake_with_master_complete,
+                server_info.clone(),
             )
             .await?;
         }
@@ -237,12 +252,18 @@ async fn read_and_handle_single_command_from_local_buffer(
                 if !is_replica {
                     return Err(anyhow::anyhow!("GETACK command not expected for masters"));
                 }
+                let num_command_bytes_str = num_command_bytes_processed_as_replica.to_string();
                 // for now just respond with REPLCONF ACK 0 as a RESP Array of bulk strings
                 let ack_response = RespData::Array(vec![
                     RespData::BulkString("REPLCONF".to_string()),
                     RespData::BulkString("ACK".to_string()),
-                    RespData::BulkString("0".to_string()),
+                    RespData::BulkString(num_command_bytes_str),
                 ]);
+                // increment the number of command bytes processed as a replica
+                {
+                    let mut server_info = server_info.lock().await;
+                    server_info.num_command_bytes_processed_as_replica += bytes_read;
+                }
                 stream
                     .write_all(ack_response.serialize_to_redis_protocol().as_bytes())
                     .await?;
@@ -432,6 +453,7 @@ async fn handle_set_command(
     resp: RespData,
     is_replica: bool,
     handshake_with_master_complete: bool,
+    server_info: Arc<Mutex<ServerInfo>>,
 ) -> Result<()> {
     let set_resp = RespData::unpack_array(&resp);
     // the second element in the array is the key
@@ -466,6 +488,11 @@ async fn handle_set_command(
                 expiry: None,
             },
         );
+    }
+    // increment the number of command bytes processed as a replica
+    if is_replica {
+        let mut server_info = server_info.lock().await;
+        server_info.num_command_bytes_processed_as_replica += message_bytes.len();
     }
     // return OK as a simple string
     if !handshake_with_master_complete {
