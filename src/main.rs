@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::Sender;
 use tokio::sync::{broadcast, Mutex};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 mod serializer;
 mod utils;
 use tokio::sync::mpsc;
@@ -343,7 +343,7 @@ async fn read_and_handle_single_command_from_local_buffer(
                 continue;
             }
 
-            let mut getack_bytes_to_add_to_master_offset = 0;
+            //let mut getack_bytes_to_add_to_master_offset = 0;
             let num_synced_replicas = if master_repl_offset == 0 {
                 replica_addresses.len()
             } else {
@@ -366,7 +366,7 @@ async fn read_and_handle_single_command_from_local_buffer(
                     if synced_counter >= num_replicas_arg {
                         break;
                     }
-                    if !is_initial_iteration {
+                    if is_initial_iteration {
                         // send the GETACK command to all replicas
                         sender.send(bytes.clone())?;
                     }
@@ -387,7 +387,7 @@ async fn read_and_handle_single_command_from_local_buffer(
                     //                        }
                     //                    }
                     //
-                    getack_bytes_to_add_to_master_offset += bytes.len();
+                    //getack_bytes_to_add_to_master_offset += bytes.len();
                     //println!("Before the sleep");
                     sleep(Duration::from_millis(50)).await;
                     //println!("After the sleep");
@@ -731,28 +731,54 @@ async fn handle_psync_command(
             let mut buf = [0; 512];
             //println!("reading reply for wait command");
             // this is dumb but basically going to sleep for a bit to give the replica time to respond
-            sleep(Duration::from_millis(50)).await;
-            loop {
-                match stream.try_read(&mut buf) {
-                    Ok(0) => {
-                        //println!("Exited wait read loop gracefully");
-                        break;
-                    }
-                    Ok(num_bytes) => {
-                        // read the bytes into bytes_read_vec
-                        bytes_read_vec.extend_from_slice(&buf[..num_bytes]);
-                        break;
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        //println!("Would block");
-                        break;
-                    }
-                    Err(e) => {
-                        //eprintln!("Error reading from socket for wait command: {}", e);
-                        break;
+
+            // NEW CODE
+            let read_timeout_duration = Duration::from_millis(250);
+            match timeout(read_timeout_duration, stream.readable()).await {
+                Ok(Ok(_)) => {
+                    match stream.try_read(&mut buf) {
+                        Ok(0) => {
+                            //println!("Exited wait read loop gracefully");
+                        }
+                        Ok(num_bytes) => {
+                            // read the bytes into bytes_read_vec
+                            bytes_read_vec.extend_from_slice(&buf[..num_bytes]);
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            //println!("Would block");
+                        }
+                        Err(_e) => {
+                            //eprintln!("Error reading from socket for wait command: {}", e);
+                        }
                     }
                 }
+                _ => {
+                    println!("Timed out waiting for replica to respond to wait command");
+                    //continue;
+                }
             }
+
+            //            loop {
+            //                match stream.try_read(&mut buf) {
+            //                    Ok(0) => {
+            //                        //println!("Exited wait read loop gracefully");
+            //                        break;
+            //                    }
+            //                    Ok(num_bytes) => {
+            //                        // read the bytes into bytes_read_vec
+            //                        bytes_read_vec.extend_from_slice(&buf[..num_bytes]);
+            //                        break;
+            //                    }
+            //                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+            //                        //println!("Would block");
+            //                        break;
+            //                    }
+            //                    Err(_e) => {
+            //                        //eprintln!("Error reading from socket for wait command: {}", e);
+            //                        break;
+            //                    }
+            //                }
+            //            }
             //println!("finished reading reply for wait command");
             //println!("bytes read for wait command: {:?}", bytes_read_vec);
             // didn't receive a GETACK response from the replica so just continue
