@@ -359,14 +359,18 @@ async fn read_and_handle_single_command_from_local_buffer(
                     .serialize_to_redis_protocol()
                     .as_bytes()
                     .to_vec();
-
+                let mut is_initial_iteration = true;
                 while Instant::now() < timeout_instant {
                     // TODO: after sending the messages on this broadcast channel,
                     // listen to their responses and read their offsets
                     if synced_counter >= num_replicas_arg {
                         break;
                     }
-                    sender.send(bytes.clone())?;
+                    if !is_initial_iteration {
+                        // send the GETACK command to all replicas
+                        sender.send(bytes.clone())?;
+                    }
+                    is_initial_iteration = false;
                     //                    for r_address in &replica_addresses {
                     //                        println!("connecting to replica");
                     //                        println!("replica address: {}", r_address);
@@ -388,7 +392,10 @@ async fn read_and_handle_single_command_from_local_buffer(
                     sleep(Duration::from_millis(50)).await;
                     //println!("After the sleep");
                     while let Ok(offset) = wait_rc_locked.try_recv() {
-                        println!("Received offset from replica: {}", offset);
+                        println!(
+                            "Received offset from replica: {}, master repl offset is {}",
+                            offset, master_repl_offset
+                        );
                         if offset >= (master_repl_offset as u64) {
                             synced_counter += 1;
                         }
@@ -405,10 +412,10 @@ async fn read_and_handle_single_command_from_local_buffer(
                 .write_all(integer_resp.serialize_to_redis_protocol().as_bytes())
                 .await?;
             // increment the master_repl_offset by the number of bytes in the GETACK command
-            {
-                let mut server_info = server_info.lock().await;
-                server_info.master_repl_offset += getack_bytes_to_add_to_master_offset;
-            }
+            //{
+            //    let mut server_info = server_info.lock().await;
+            //    server_info.master_repl_offset += getack_bytes_to_add_to_master_offset;
+            //}
         }
         _ => {
             println!("Unknown command");
@@ -709,10 +716,10 @@ async fn handle_psync_command(
 
         // When reading the results back from GETACK responses we clear the read buffer beforehand
         if is_wait_command {
-            println!("is wait command");
-            println!("Clearing read buffer from TCP stream");
+            //println!("is wait command");
+            //println!("Clearing read buffer from TCP stream");
             clear_read_buffer_from_tcp_stream(stream);
-            println!("Finished clearing read buffer from TCP stream");
+            //println!("Finished clearing read buffer from TCP stream");
         }
         // whenever a message is received from the broadcast channel, simply forward it to the replica
         stream.write_all(&replica_command).await?;
@@ -722,13 +729,13 @@ async fn handle_psync_command(
         if is_wait_command {
             let mut bytes_read_vec = Vec::<u8>::new();
             let mut buf = [0; 512];
-            println!("reading reply for wait command");
+            //println!("reading reply for wait command");
             // this is dumb but basically going to sleep for a bit to give the replica time to respond
             sleep(Duration::from_millis(50)).await;
             loop {
                 match stream.try_read(&mut buf) {
                     Ok(0) => {
-                        println!("Exited wait read loop gracefully");
+                        //println!("Exited wait read loop gracefully");
                         break;
                     }
                     Ok(num_bytes) => {
@@ -737,17 +744,17 @@ async fn handle_psync_command(
                         break;
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        println!("Would block");
+                        //println!("Would block");
                         break;
                     }
                     Err(e) => {
-                        eprintln!("Error reading from socket for wait command: {}", e);
+                        //eprintln!("Error reading from socket for wait command: {}", e);
                         break;
                     }
                 }
             }
-            println!("finished reading reply for wait command");
-            println!("bytes read for wait command: {:?}", bytes_read_vec);
+            //println!("finished reading reply for wait command");
+            //println!("bytes read for wait command: {:?}", bytes_read_vec);
             // didn't receive a GETACK response from the replica so just continue
             if bytes_read_vec.is_empty() {
                 println!("No bytes read for wait command");
@@ -772,7 +779,10 @@ async fn handle_psync_command(
             wait_tx_locked.send(u64_offset).await?;
             println!("Forwarded offset to WAIT command: {}", offset);
         }
-        println!("Forwarded command to replica: {:?}", replica_command);
+        println!(
+            "Forwarded command to replica: {:?}, is wait command {:?}",
+            replica_command, is_wait_command
+        );
     }
 }
 
