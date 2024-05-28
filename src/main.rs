@@ -1,16 +1,18 @@
 use anyhow::Result;
 use serializer::{parse_resp_data, RespData};
 use std::collections::HashMap;
-use std::env;
 use std::sync::Arc;
 use std::time;
+use std::{env, io};
 use time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::Sender;
 use tokio::sync::{broadcast, Mutex};
+use tokio::time::sleep;
 mod serializer;
 mod utils;
+use tokio::sync::mpsc;
 
 struct StoredValue {
     value: String,
@@ -26,7 +28,7 @@ struct ServerInfo {
     handshake_with_master_complete: bool,
     num_command_bytes_processed_as_replica: usize,
     // For counting purposes we treat this as the number of replicas that have finished the handshake
-    num_connected_replicas: usize,
+    replica_addresses: Vec<String>,
 }
 
 #[tokio::main]
@@ -57,6 +59,7 @@ async fn main() -> Result<()> {
     // each replica will have its own broadcast receiver and is maintained on a dedicated green
     // thread
     let (tx, _rc) = broadcast::channel::<Vec<u8>>(16);
+    let (wait_tx, wait_rc) = mpsc::channel::<u64>(64);
 
     let role = match replica_info {
         Some(_) => "slave",
@@ -69,7 +72,7 @@ async fn main() -> Result<()> {
         master_repl_offset,
         handshake_with_master_complete: false,
         num_command_bytes_processed_as_replica: 0,
-        num_connected_replicas: 0,
+        replica_addresses: Vec::new(),
     }));
 
     let listener = TcpListener::bind(sock).await?;
@@ -77,6 +80,10 @@ async fn main() -> Result<()> {
     let sender_arc_listener_clone = Arc::clone(&sender_arc);
     let storage_listener_clone = Arc::clone(&storage);
     let server_info_listener_clone = Arc::clone(&server_info);
+    let wait_tx_arc = Arc::new(Mutex::new(wait_tx));
+    let wait_rc_arc = Arc::new(Mutex::new(wait_rc));
+    let wait_tx_arc_clone = Arc::clone(&wait_tx_arc);
+    let wait_rc_arc_clone = Arc::clone(&wait_rc_arc);
 
     // !! In terms of control flow, we need the listener loop to run ASAP and we then optionally
     // !! perform the replica handshake. If this isn't respected then you run into situations where
@@ -94,7 +101,9 @@ async fn main() -> Result<()> {
                 let storage = storage_listener_clone.clone();
                 let server_info = server_info_listener_clone.clone();
                 let sender = sender_arc_listener_clone.clone();
-                handle_connection(stream, storage, server_info, sender)
+                let wait_tx = wait_tx_arc_clone.clone();
+                let wait_rc = wait_rc_arc_clone.clone();
+                handle_connection(stream, storage, server_info, sender, wait_tx, wait_rc)
                     .await
                     .unwrap();
             }
@@ -111,6 +120,8 @@ async fn main() -> Result<()> {
             storage.clone(),
             server_info.clone(),
             sender_arc.clone(),
+            wait_tx_arc.clone(),
+            wait_rc_arc.clone(),
         )
         .await
         {
@@ -125,8 +136,12 @@ async fn main() -> Result<()> {
             let storage: Arc<Mutex<HashMap<String, StoredValue>>> = storage.clone();
             let server_info = server_info.clone();
             let sender = sender_arc.clone();
+            let wait_tx = wait_tx_arc.clone();
+            let wait_rc = wait_rc_arc.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, storage, server_info, sender).await {
+                if let Err(e) =
+                    handle_connection(stream, storage, server_info, sender, wait_tx, wait_rc).await
+                {
                     eprintln!("Error handling connection: {}", e);
                 }
             });
@@ -140,6 +155,8 @@ async fn handle_connection(
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
     server_info: Arc<Mutex<ServerInfo>>,
     sender: Arc<Sender<Vec<u8>>>,
+    wait_tx: Arc<Mutex<mpsc::Sender<u64>>>,
+    wait_rc: Arc<Mutex<mpsc::Receiver<u64>>>,
 ) -> Result<()> {
     // Primer on sockets: https://docs.python.org/3/howto/sockets.html
     let mut buf = [0; 512];
@@ -160,6 +177,8 @@ async fn handle_connection(
                     storage.clone(),
                     server_info.clone(),
                     sender.clone(),
+                    wait_tx.clone(),
+                    wait_rc.clone(),
                 )
                 .await?;
             }
@@ -176,6 +195,8 @@ async fn read_and_handle_single_command_from_local_buffer(
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
     server_info: Arc<Mutex<ServerInfo>>,
     sender: Arc<Sender<Vec<u8>>>,
+    wait_tx: Arc<Mutex<mpsc::Sender<u64>>>,
+    wait_rc: Arc<Mutex<mpsc::Receiver<u64>>>,
     local_buffer: &mut Vec<u8>,
 ) -> Result<()> {
     let (
@@ -293,19 +314,101 @@ async fn read_and_handle_single_command_from_local_buffer(
                 master_replid,
                 master_repl_offset,
                 server_info.clone(),
+                wait_tx.clone(),
             )
             .await?;
         }
         "wait" => {
-            // Just respond with 0 (as a RESP Integer) for now. In the test there are no connected replicas
-            let num_connected_replicas = {
+            if is_replica {
+                return Err(anyhow::anyhow!("WAIT command not expected for replicas"));
+            }
+
+            let args = RespData::unpack_array(&resp);
+            let num_replicas_arg = args[1].serialize_to_list_of_strings(false)[0]
+                .clone()
+                .parse::<usize>()?;
+            let wait_timeout_arg = args[2].serialize_to_list_of_strings(false)[0]
+                .clone()
+                .parse::<usize>()?;
+            let timeout_instant = Instant::now() + Duration::from_millis(wait_timeout_arg as u64);
+
+            let replica_addresses = {
                 let server_info = server_info.lock().await;
-                server_info.num_connected_replicas
+                server_info.replica_addresses.clone()
             };
-            let integer_resp = RespData::Integer(num_connected_replicas as isize);
+
+            let mut wait_rc_locked = wait_rc.lock().await;
+            // Discard all messages currently in the broadcast channel
+            while let Ok(_) = wait_rc_locked.try_recv() {
+                continue;
+            }
+
+            let mut getack_bytes_to_add_to_master_offset = 0;
+            let num_synced_replicas = if master_repl_offset == 0 {
+                replica_addresses.len()
+            } else {
+                // send GETACK to all replicas and wait for them to acknowledge
+                // or wait for a timeout:
+                let mut synced_counter = 0;
+                let getack_command = RespData::Array(vec![
+                    RespData::BulkString("REPLCONF".to_string()),
+                    RespData::BulkString("GETACK".to_string()),
+                    RespData::BulkString("*".to_string()),
+                ]);
+                let bytes = getack_command
+                    .serialize_to_redis_protocol()
+                    .as_bytes()
+                    .to_vec();
+
+                while Instant::now() < timeout_instant {
+                    // TODO: after sending the messages on this broadcast channel,
+                    // listen to their responses and read their offsets
+                    if synced_counter >= num_replicas_arg {
+                        break;
+                    }
+                    sender.send(bytes.clone())?;
+                    //                    for r_address in &replica_addresses {
+                    //                        println!("connecting to replica");
+                    //                        println!("replica address: {}", r_address);
+                    //                        let mut replica_stream = TcpStream::connect(r_address).await?;
+                    //                        println!("successfully connected to replica");
+                    //                        let offset =
+                    //                            send_getack_to_replica_and_read_offset(&mut replica_stream, &bytes)
+                    //                                .await?;
+                    //                        if offset >= master_repl_offset {
+                    //                            synced_counter += 1;
+                    //                        }
+                    //                        if synced_counter >= num_replicas_arg {
+                    //                            break;
+                    //                        }
+                    //                    }
+                    //
+                    getack_bytes_to_add_to_master_offset += bytes.len();
+                    //println!("Before the sleep");
+                    sleep(Duration::from_millis(50)).await;
+                    //println!("After the sleep");
+                    while let Ok(offset) = wait_rc_locked.try_recv() {
+                        println!("Received offset from replica: {}", offset);
+                        if offset >= (master_repl_offset as u64) {
+                            synced_counter += 1;
+                        }
+                        if synced_counter >= num_replicas_arg {
+                            break;
+                        }
+                    }
+                }
+                synced_counter
+            };
+            println!("Number of synced replicas: {}", num_synced_replicas);
+            let integer_resp = RespData::Integer(num_synced_replicas as isize);
             stream
                 .write_all(integer_resp.serialize_to_redis_protocol().as_bytes())
                 .await?;
+            // increment the master_repl_offset by the number of bytes in the GETACK command
+            {
+                let mut server_info = server_info.lock().await;
+                server_info.master_repl_offset += getack_bytes_to_add_to_master_offset;
+            }
         }
         _ => {
             println!("Unknown command");
@@ -322,12 +425,28 @@ async fn read_and_handle_single_command_from_local_buffer(
     Ok(())
 }
 
+//async fn send_getack_to_replica_and_read_offset(
+//    stream: &mut TcpStream,
+//    bytes: &[u8],
+//) -> Result<usize> {
+//    stream.write_all(bytes).await?;
+//    let mut buf = [0; 512];
+//    let n = stream.read(&mut buf).await?;
+//    let (resp, _) = parse_resp_data(&buf[..n])?;
+//    let offset_resp = RespData::unpack_array(&resp);
+//    let offset = offset_resp[2].serialize_to_list_of_strings(false)[0]
+//        .clone()
+//        .parse()?;
+//    Ok(offset)
+//}
 async fn process_local_buffer(
     stream: &mut tokio::net::TcpStream,
     local_buffer: &mut Vec<u8>,
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
     server_info: Arc<Mutex<ServerInfo>>,
     sender: Arc<Sender<Vec<u8>>>,
+    wait_tx: Arc<Mutex<mpsc::Sender<u64>>>,
+    wait_rc: Arc<Mutex<mpsc::Receiver<u64>>>,
 ) -> Result<()> {
     // Multiple commands can get fetched in a single read from the TCP stream, so we need to make sure
     // we handle all of the messages inside our local buffer because otherwise we'll only process 1 command
@@ -343,6 +462,8 @@ async fn process_local_buffer(
             storage.clone(),
             server_info.clone(),
             sender.clone(),
+            wait_tx.clone(),
+            wait_rc.clone(),
             local_buffer,
         )
         .await?;
@@ -356,6 +477,8 @@ async fn perform_replica_master_handshake(
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
     server_info: Arc<Mutex<ServerInfo>>,
     sender: Arc<Sender<Vec<u8>>>,
+    wait_tx: Arc<Mutex<mpsc::Sender<u64>>>,
+    wait_rc: Arc<Mutex<mpsc::Receiver<u64>>>,
 ) -> Result<()> {
     // connect to the master using the provided IP and
     let mut stream = TcpStream::connect(format!("{}:{}", master_ip, master_port)).await?;
@@ -429,7 +552,7 @@ async fn perform_replica_master_handshake(
     // This traffic isn't directed to the main listener loop, so we need to handle it here.
     // We expect to receive a FULLRESYNC command from the master followed by an RDB file, and then potentially
     // more commands.
-    handle_connection(stream, storage, server_info, sender).await?;
+    handle_connection(stream, storage, server_info, sender, wait_tx, wait_rc).await?;
     Ok(())
 }
 
@@ -522,6 +645,12 @@ async fn handle_set_command(
     // null byte padding at the end. Instead, we need to send the exact bytes
     // that we actually read to construct the message
     if !is_replica {
+        let mut server_info = server_info.lock().await;
+        // increment master_replication_offset by the number of bytes in the message_bytes
+        // I think there technically is supposed to be a system where the master pings replicas
+        // to make sure they're alive and I suspect we're also supposed to increment the offset
+        // in the case, but I don't think its necessary to implement.
+        server_info.master_repl_offset += message_bytes.len();
         sender.send(message_bytes.to_vec())?;
     }
     Ok(())
@@ -534,6 +663,7 @@ async fn handle_psync_command(
     master_replid: String,
     master_repl_offset: usize,
     server_info: Arc<Mutex<ServerInfo>>,
+    wait_tx: Arc<Mutex<mpsc::Sender<u64>>>,
 ) -> Result<()> {
     let psync_resp = RespData::unpack_array(resp);
     let _replication_id = psync_resp[1].serialize_to_list_of_strings(false)[0].clone();
@@ -555,7 +685,10 @@ async fn handle_psync_command(
     // increment the number of connected replicas
     {
         let mut server_info = server_info.lock().await;
-        server_info.num_connected_replicas += 1;
+        // get the address of the replica
+        let addr = stream.peer_addr().unwrap().to_string();
+        println!("Replica address: {}", addr);
+        server_info.replica_addresses.push(addr);
     }
     // lastly, send an empty RDB file back to the replica
     let hardcoded_empty_rdb_file_hex = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
@@ -567,9 +700,100 @@ async fn handle_psync_command(
     let mut replica_rx = sender.subscribe();
     loop {
         let replica_command = replica_rx.recv().await?;
+        // check if its a getack command that's being propagated to replicas
+        let (replica_command_resp, _num_bytes) = parse_resp_data(&replica_command)?;
+        let replica_command_list = replica_command_resp.serialize_to_list_of_strings(true);
+        let is_wait_command = replica_command_list.len() == 3
+            && replica_command_list[0] == "replconf"
+            && replica_command_list[1] == "getack";
+
+        // When reading the results back from GETACK responses we clear the read buffer beforehand
+        if is_wait_command {
+            println!("is wait command");
+            println!("Clearing read buffer from TCP stream");
+            clear_read_buffer_from_tcp_stream(stream);
+            println!("Finished clearing read buffer from TCP stream");
+        }
         // whenever a message is received from the broadcast channel, simply forward it to the replica
         stream.write_all(&replica_command).await?;
         // make sure messages are sent to the replica immediately
         stream.flush().await?;
+        // for wait commands, read
+        if is_wait_command {
+            let mut bytes_read_vec = Vec::<u8>::new();
+            let mut buf = [0; 512];
+            println!("reading reply for wait command");
+            // this is dumb but basically going to sleep for a bit to give the replica time to respond
+            sleep(Duration::from_millis(50)).await;
+            loop {
+                match stream.try_read(&mut buf) {
+                    Ok(0) => {
+                        println!("Exited wait read loop gracefully");
+                        break;
+                    }
+                    Ok(num_bytes) => {
+                        // read the bytes into bytes_read_vec
+                        bytes_read_vec.extend_from_slice(&buf[..num_bytes]);
+                        break;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        println!("Would block");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading from socket for wait command: {}", e);
+                        break;
+                    }
+                }
+            }
+            println!("finished reading reply for wait command");
+            println!("bytes read for wait command: {:?}", bytes_read_vec);
+            // didn't receive a GETACK response from the replica so just continue
+            if bytes_read_vec.is_empty() {
+                println!("No bytes read for wait command");
+                continue;
+            }
+            let (resp, _) = parse_resp_data(&bytes_read_vec)?;
+            let offset_resp = RespData::unpack_array(&resp);
+            // we expect to get REPLCONF ACK <offset> as a response
+            if !(offset_resp.len() == 3
+                && offset_resp[0] == RespData::BulkString("REPLCONF".to_string())
+                && offset_resp[1] == RespData::BulkString("ACK".to_string()))
+            {
+                anyhow::bail!("Unexpected response from replica");
+            }
+            let offset = offset_resp[2].serialize_to_list_of_strings(false)[0]
+                .clone()
+                .parse::<usize>()?;
+            // send the replica's offset back upstreawm to the thread thats handling the WAIT
+            // command via the mpsc channel
+            let u64_offset = offset.try_into().unwrap();
+            let wait_tx_locked = wait_tx.lock().await;
+            wait_tx_locked.send(u64_offset).await?;
+            println!("Forwarded offset to WAIT command: {}", offset);
+        }
+        println!("Forwarded command to replica: {:?}", replica_command);
+    }
+}
+
+fn clear_read_buffer_from_tcp_stream(stream: &mut TcpStream) {
+    let mut buf = [0; 512];
+    loop {
+        match stream.try_read(&mut buf) {
+            Ok(0) => {
+                break;
+            }
+            Ok(_) => {
+                continue;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                println!("Would block");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Error reading from socket: {}", e);
+                break;
+            }
+        }
     }
 }
