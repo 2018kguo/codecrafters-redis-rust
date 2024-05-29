@@ -29,6 +29,8 @@ struct ServerInfo {
     num_command_bytes_processed_as_replica: usize,
     // For counting purposes we treat this as the number of replicas that have finished the handshake
     replica_addresses: Vec<String>,
+    rdb_file_dir: Option<String>,
+    rdb_file_name: Option<String>,
 }
 
 struct ServerMessageChannels {
@@ -42,6 +44,8 @@ async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut port_to_use: usize = 6379;
     let mut replica_info: Option<String> = None;
+    let mut rdb_file_dir: Option<String> = None;
+    let mut rdb_file_name: Option<String> = None;
 
     let port_flag_position = args.iter().position(|s| s == "--port");
     if let Some(pos) = port_flag_position {
@@ -50,6 +54,14 @@ async fn main() -> Result<()> {
     let replica_flag_position = args.iter().position(|s| s == "--replicaof");
     if let Some(pos) = replica_flag_position {
         replica_info = Some(args[pos + 1].clone());
+    }
+    let dir_flag_position = args.iter().position(|s| s == "--dir");
+    if let Some(pos) = dir_flag_position {
+        rdb_file_dir = Some(args[pos + 1].clone());
+    }
+    let rdb_file_name_flag_position = args.iter().position(|s| s == "--rdb");
+    if let Some(pos) = rdb_file_name_flag_position {
+        rdb_file_name = Some(args[pos + 1].clone());
     }
 
     // generate 40 character long random string for the master_replid
@@ -79,6 +91,8 @@ async fn main() -> Result<()> {
         handshake_with_master_complete: false,
         num_command_bytes_processed_as_replica: 0,
         replica_addresses: Vec::new(),
+        rdb_file_dir,
+        rdb_file_name,
     }));
 
     let listener = TcpListener::bind(sock).await?;
@@ -218,6 +232,8 @@ async fn read_and_handle_single_command_from_local_buffer(
         master_repl_offset,
         handshake_with_master_complete,
         num_command_bytes_processed_as_replica,
+        rdb_file_dir,
+        rdb_file_name,
     ) = {
         let server_info = server_info.lock().await;
         (
@@ -226,6 +242,8 @@ async fn read_and_handle_single_command_from_local_buffer(
             server_info.master_repl_offset,
             server_info.handshake_with_master_complete,
             server_info.num_command_bytes_processed_as_replica,
+            server_info.rdb_file_dir.clone(),
+            server_info.rdb_file_name.clone(),
         )
     };
     let is_replica = role == "slave";
@@ -421,6 +439,39 @@ async fn read_and_handle_single_command_from_local_buffer(
             {
                 let mut server_info = server_info.lock().await;
                 server_info.master_repl_offset += getack_bytes_to_add_to_master_offset;
+            }
+        }
+        "config" => {
+            let config_resp = RespData::unpack_array(&resp);
+            let subcommand = config_resp[1].serialize_to_list_of_strings(true)[0].clone();
+            if subcommand != "get" {
+                return Err(anyhow::anyhow!("Only the CONFIG GET command is supported"));
+            }
+            let get_arg = config_resp[2].serialize_to_list_of_strings(true)[0].clone();
+            match get_arg.as_str() {
+                "dir" => {
+                    // respond with a RESP array of dir and the value
+                    let dir_resp = RespData::Array(vec![
+                        RespData::BulkString("dir".to_string()),
+                        RespData::BulkString(rdb_file_dir.unwrap()),
+                    ]);
+                    stream
+                        .write_all(dir_resp.serialize_to_redis_protocol().as_bytes())
+                        .await?;
+                }
+                "dbfilename" => {
+                    // respond with a RESP array of dbfilename and the value
+                    let dbfilename_resp = RespData::Array(vec![
+                        RespData::BulkString("dbfilename".to_string()),
+                        RespData::BulkString(rdb_file_name.unwrap()),
+                    ]);
+                    stream
+                        .write_all(dbfilename_resp.serialize_to_redis_protocol().as_bytes())
+                        .await?;
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Invalid argument for CONFIG GET"));
+                }
             }
         }
         _ => {
