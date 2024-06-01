@@ -537,6 +537,9 @@ async fn read_and_handle_single_command_from_local_buffer(
                 }
             }
         }
+        "type" => {
+            handle_type_command(stream, storage.clone(), &resp).await?;
+        }
         _ => {
             println!("Unknown command");
             // slaves receive the FULLRESYNC command from the master
@@ -687,6 +690,30 @@ async fn handle_get_command(
             stream.write_all("$-1\r\n".as_bytes()).await?;
         }
     }
+    Ok(())
+}
+
+async fn handle_type_command(
+    stream: &mut TcpStream,
+    storage: Arc<Mutex<HashMap<String, StoredValue>>>,
+    resp: &RespData,
+) -> Result<()> {
+    let type_resp = RespData::unpack_array(resp);
+    let key_str = type_resp[1].serialize_to_list_of_strings(false)[0].clone();
+    let held_storage = storage.lock().await;
+    let val_type = match held_storage.get(&key_str) {
+        Some(stored_value)
+            if stored_value.expiry.is_none() || stored_value.expiry.unwrap() > Instant::now() =>
+        {
+            "string"
+        }
+        // Key has either expired or never existed in the map.
+        _ => "none",
+    };
+    let resp_response = RespData::SimpleString(val_type.to_string());
+    stream
+        .write_all(resp_response.serialize_to_redis_protocol().as_bytes())
+        .await?;
     Ok(())
 }
 
