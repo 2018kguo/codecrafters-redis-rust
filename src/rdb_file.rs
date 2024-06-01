@@ -3,9 +3,10 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::prelude::*;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct RDBFileResult {
-    pub key_value_mapping: HashMap<String, String>,
+    pub key_value_mapping: HashMap<String, (String, Option<Instant>)>,
 }
 
 pub fn parse_rdb_file_at_path(path: &str) -> Result<RDBFileResult> {
@@ -71,6 +72,34 @@ pub fn parse_rdb_file_at_path(path: &str) -> Result<RDBFileResult> {
                 // we're reading a key value pair
                 // each key value pair has 4 parts: optional expiry, 1 byte flag for the value
                 // type, the key as a redis string, and the value encoded according to the flag
+                let mut expiry_instant = None;
+                let since_unix_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+                if buffer[0] == 0xFD {
+                    // the expiry is a 4 byte integer in little endian format representing the unix
+                    // timestamp in seconds
+                    let timestamp_seconds =
+                        u32::from_le_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]);
+                    buffer.drain(0..5);
+                    println!("Expiry seconds: {}", timestamp_seconds);
+                    expiry_instant = Some(
+                        Instant::now() + Duration::from_secs(timestamp_seconds as u64)
+                            - Duration::from_secs(since_unix_epoch.as_secs()),
+                    );
+                } else if buffer[0] == 0xFC {
+                    // the expiry is a 8 byte integer in little endian format representing the unix
+                    // timestamp in milliseconds
+                    let timestamp_ms = u64::from_le_bytes([
+                        buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
+                        buffer[7], buffer[8],
+                    ]);
+                    buffer.drain(0..9);
+                    println!("Expiry ms: {}", timestamp_ms);
+                    expiry_instant = Some(
+                        Instant::now() + Duration::from_millis(timestamp_ms)
+                            - Duration::from_secs(since_unix_epoch.as_secs()),
+                    );
+                }
                 let value_type_flag = buffer[0];
                 buffer.drain(0..1);
                 if value_type_flag != 0 {
@@ -84,7 +113,9 @@ pub fn parse_rdb_file_at_path(path: &str) -> Result<RDBFileResult> {
                 buffer.drain(0..bytes_read as usize);
 
                 println!("key: {}, value: {}", key_string, value_string);
-                result.key_value_mapping.insert(key_string, value_string);
+                result
+                    .key_value_mapping
+                    .insert(key_string, (value_string, expiry_instant));
             }
         }
     }

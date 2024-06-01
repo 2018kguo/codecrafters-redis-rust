@@ -17,7 +17,7 @@ mod rdb_file;
 mod serializer;
 mod utils;
 
-struct StoredValue {
+pub struct StoredValue {
     value: String,
     expiry: Option<Instant>,
 }
@@ -89,15 +89,23 @@ async fn main() -> Result<()> {
             eprintln!("Error parsing RDB file: {}", e);
         } else {
             let mapping = rdb_file_result.unwrap().key_value_mapping;
-            for (key, value) in &mapping {
-                println!("Key: {}, Value: {}", key, value);
+            for (key, value_plus_expiry) in &mapping {
+                let value = &value_plus_expiry.0;
+                let expiry = value_plus_expiry.1;
+                println!("Key: {}, Value: {}, expiry: {:?}", key, value, expiry);
                 let stored_value = StoredValue {
                     value: value.to_string(),
-                    expiry: None,
+                    expiry,
                 };
                 storage.lock().await.insert(key.to_string(), stored_value);
             }
-            rdb_file_key_value_mapping = Some(mapping.clone());
+            // only take the string values from the mapping and ignore the expiry values
+            rdb_file_key_value_mapping = Some(
+                mapping
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.0.clone()))
+                    .collect(),
+            );
         }
     }
     // use a broadcast channel to send messages to all connected replicas
