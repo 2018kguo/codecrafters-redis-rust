@@ -76,6 +76,26 @@ async fn main() -> Result<()> {
     // use an Arc<Mutex<HashMap>> to store the key-value pairs in memory across threads
     let storage: Arc<Mutex<HashMap<String, StoredValue>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    if rdb_file_dir.is_some() && rdb_file_name.is_some() {
+        let file_path = format!(
+            "{}/{}",
+            &rdb_file_dir.clone().unwrap(),
+            &rdb_file_name.clone().unwrap()
+        );
+        let rdb_file_result = parse_rdb_file_at_path(&file_path);
+        if let Err(e) = rdb_file_result {
+            eprintln!("Error parsing RDB file: {}", e);
+        } else {
+            for (key, value) in rdb_file_result.unwrap().key_value_mapping {
+                println!("Key: {}, Value: {}", key, value);
+                let stored_value = StoredValue {
+                    value,
+                    expiry: None,
+                };
+                storage.lock().await.insert(key, stored_value);
+            }
+        }
+    }
     // use a broadcast channel to send messages to all connected replicas
     // each replica will have its own broadcast receiver and is maintained on a dedicated green
     // thread
