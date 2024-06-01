@@ -34,6 +34,7 @@ struct ServerInfo {
     replica_addresses: Vec<String>,
     rdb_file_dir: Option<String>,
     rdb_file_name: Option<String>,
+    rdb_file_key_value_mapping: Option<HashMap<String, String>>,
 }
 
 struct ServerMessageChannels {
@@ -76,6 +77,7 @@ async fn main() -> Result<()> {
     // use an Arc<Mutex<HashMap>> to store the key-value pairs in memory across threads
     let storage: Arc<Mutex<HashMap<String, StoredValue>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    let mut rdb_file_key_value_mapping = None;
     if rdb_file_dir.is_some() && rdb_file_name.is_some() {
         let file_path = format!(
             "{}/{}",
@@ -86,14 +88,16 @@ async fn main() -> Result<()> {
         if let Err(e) = rdb_file_result {
             eprintln!("Error parsing RDB file: {}", e);
         } else {
-            for (key, value) in rdb_file_result.unwrap().key_value_mapping {
+            let mapping = rdb_file_result.unwrap().key_value_mapping;
+            for (key, value) in &mapping {
                 println!("Key: {}, Value: {}", key, value);
                 let stored_value = StoredValue {
-                    value,
+                    value: value.to_string(),
                     expiry: None,
                 };
-                storage.lock().await.insert(key, stored_value);
+                storage.lock().await.insert(key.to_string(), stored_value);
             }
+            rdb_file_key_value_mapping = Some(mapping.clone());
         }
     }
     // use a broadcast channel to send messages to all connected replicas
@@ -116,6 +120,7 @@ async fn main() -> Result<()> {
         replica_addresses: Vec::new(),
         rdb_file_dir,
         rdb_file_name,
+        rdb_file_key_value_mapping,
     }));
 
     let listener = TcpListener::bind(sock).await?;
@@ -257,6 +262,7 @@ async fn read_and_handle_single_command_from_local_buffer(
         num_command_bytes_processed_as_replica,
         rdb_file_dir,
         rdb_file_name,
+        mapping,
     ) = {
         let server_info = server_info.lock().await;
         (
@@ -267,6 +273,7 @@ async fn read_and_handle_single_command_from_local_buffer(
             server_info.num_command_bytes_processed_as_replica,
             server_info.rdb_file_dir.clone(),
             server_info.rdb_file_name.clone(),
+            server_info.rdb_file_key_value_mapping.clone(),
         )
     };
     let is_replica = role == "slave";
@@ -500,12 +507,9 @@ async fn read_and_handle_single_command_from_local_buffer(
         "keys" => {
             println!("dir: {:?}", rdb_file_dir);
             println!("name: {:?}", rdb_file_name);
-            let rdb_file_path_str = format!("{}/{}", rdb_file_dir.unwrap(), rdb_file_name.unwrap());
-            let rdb_file_result = parse_rdb_file_at_path(&rdb_file_path_str);
-            println!("finished parsing rdb file");
-            match rdb_file_result {
-                Ok(rdb_file) => {
-                    let keys = rdb_file.key_value_mapping.keys();
+            match mapping {
+                Some(key_value_mapping) => {
+                    let keys = key_value_mapping.keys();
                     println!("keys: {:?}", keys);
                     // response with a RESP array of all the keys encoded as bulk strings
                     let keys_resp = keys
@@ -516,8 +520,7 @@ async fn read_and_handle_single_command_from_local_buffer(
                         .write_all(array_resp.serialize_to_redis_protocol().as_bytes())
                         .await?;
                 }
-                Err(e) => {
-                    println!("Error parsing RDB file: {}", e);
+                None => {
                     // respond with empty array
                     let empty_array_resp = RespData::Array(Vec::new());
                     stream

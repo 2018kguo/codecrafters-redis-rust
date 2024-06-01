@@ -12,6 +12,7 @@ pub fn parse_rdb_file_at_path(path: &str) -> Result<RDBFileResult> {
     let mut file = File::open(path)?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
+    println!("buffer {:?}", &buffer);
     let bytes_read = read_magic_redis_string(&buffer)?;
     buffer.drain(0..bytes_read as usize);
     let (redis_version_bytes_read, _version) = read_redis_version(&buffer)?;
@@ -19,7 +20,6 @@ pub fn parse_rdb_file_at_path(path: &str) -> Result<RDBFileResult> {
     let mut result = RDBFileResult {
         key_value_mapping: HashMap::new(),
     };
-    let mut cur_key: Option<String> = None;
     loop {
         if buffer.is_empty() {
             break;
@@ -44,11 +44,10 @@ pub fn parse_rdb_file_at_path(path: &str) -> Result<RDBFileResult> {
             // selectdb
             0xFE => {
                 // length encoded field
-                let (bytes_read, db_num) = handle_reading_rdb_string(&buffer[1..])?;
+                let (length, bytes_read, _) = read_length_and_encoding(&buffer[1..])?;
                 println!("bytes_read: {}", bytes_read);
-                println!("db_num: {}", db_num);
                 buffer.drain(0..bytes_read as usize + 1);
-                println!("Select db: {}", db_num);
+                println!("Select db: {}", length);
             }
             // resizedb
             0xFB => {
@@ -56,29 +55,36 @@ pub fn parse_rdb_file_at_path(path: &str) -> Result<RDBFileResult> {
                 // first is the db hash table size, second is the expiry hash table size
 
                 // db hash table size
-                let (bytes_read, db_hash_table_size) = handle_reading_rdb_string(&buffer[1..])?;
+                println!("WE IN HERE");
+                println!("buffer: {:?}", buffer);
+                let (length, bytes_read, _) = read_length_and_encoding(&buffer[1..])?;
+                println!("bytes_read: {}", bytes_read);
                 buffer.drain(0..bytes_read as usize + 1);
-                println!("db_hash_table_size: {}", db_hash_table_size);
+                println!("db_hash_table_size: {}", length);
                 // expiry hash table size
-                let (bytes_read, expiry_hash_table_size) = handle_reading_rdb_string(&buffer)?;
+                let (length, bytes_read, _) = read_length_and_encoding(&buffer)?;
+                println!("bytes_read for expiry: {}", bytes_read);
                 buffer.drain(0..bytes_read as usize);
-                println!("expiry_hash_table_size: {}", expiry_hash_table_size);
+                println!("expiry_hash_table_size: {}", length);
             }
             _ => {
-                println!("WE IN HERE");
-                // we should be reading the actual data, finally
-                let (bytes_read, string_val) = handle_reading_rdb_string(&buffer)?;
-                println!("bytes_read: {}", bytes_read);
-                println!("string_val: {}", string_val);
+                // we're reading a key value pair
+                // each key value pair has 4 parts: optional expiry, 1 byte flag for the value
+                // type, the key as a redis string, and the value encoded according to the flag
+                let value_type_flag = buffer[0];
+                buffer.drain(0..1);
+                if value_type_flag != 0 {
+                    // only string values are supported for now
+                    unimplemented!();
+                }
+                let (bytes_read, key_string) = handle_reading_rdb_string(&buffer)?;
                 buffer.drain(0..bytes_read as usize);
 
-                if cur_key.is_none() {
-                    cur_key = Some(string_val.clone());
-                    result.key_value_mapping.insert(string_val, "".to_string());
-                } else {
-                    let key = result.key_value_mapping.keys().last().unwrap();
-                    result.key_value_mapping.insert(key.to_string(), string_val);
-                }
+                let (bytes_read, value_string) = handle_reading_rdb_string(&buffer)?;
+                buffer.drain(0..bytes_read as usize);
+
+                println!("key: {}, value: {}", key_string, value_string);
+                result.key_value_mapping.insert(key_string, value_string);
             }
         }
     }
@@ -138,63 +144,83 @@ fn handle_reading_rdb_string(buf: &[u8]) -> Result<(u64, String)> {
     // 11 - if next 6 bits are 0, then a 8 bit integer follows, if the next 6 bits are 1, then a 16 bit integer follows, if the next 6 bits are 2, then a 32 bit integer follows
     // if the next 6 bits are 3, then its a compressed LZF string
     // ints are stored in little endian format
-    let most_significant_2_bits = buf[0] >> 6;
-    let (length_of_string, string) = match most_significant_2_bits {
+    println!("buf[0]: {}", buf[0]);
+    let (length, bytes_read, is_encoded) = read_length_and_encoding(buf)?;
+    println!(
+        "length: {}, bytes_read: {}, is_encoded: {}",
+        length, bytes_read, is_encoded
+    );
+    match is_encoded {
+        true => {
+            let (length_of_string, string) =
+                handle_reading_encoded_value(&buf[bytes_read as usize..])?;
+            Ok((length_of_string + bytes_read, string))
+        }
+        false => {
+            let string = std::str::from_utf8(
+                &buf[bytes_read as usize..length as usize + bytes_read as usize],
+            )
+            .map_err(|_| anyhow::anyhow!("Invalid string"))?;
+            Ok((length + bytes_read, string.to_string()))
+        }
+    }
+}
+
+fn handle_reading_encoded_value(buf: &[u8]) -> Result<(u64, String)> {
+    let least_significant_6_bits = buf[0] & 0x3F;
+    match least_significant_6_bits {
         0 => {
-            println!("buf[0]: {}", buf[0]);
-            let length_of_string = buf[0] & 0x3F;
-            println!("length of string: {}", length_of_string);
-            let string = std::str::from_utf8(&buf[1..length_of_string as usize + 1])
-                .map_err(|_| anyhow::anyhow!("Invalid string"))?;
-            // Add 1 for the first length byte
-            (length_of_string as u64 + 1, string.to_string())
+            let int = buf[1];
+            // First byte indicated that an 8 bit integer follows
+            Ok((2, int.to_string()))
         }
         1 => {
-            let length_of_string = (((buf[0] & 0x3F) as u16) << 8) | buf[1] as u16;
-            let string = std::str::from_utf8(&buf[2..length_of_string as usize + 2])
-                .map_err(|_| anyhow::anyhow!("Invalid string"))?;
-            // Add 2 for the first 2 bytes needed to calculate the length
-            (length_of_string as u64 + 2, string.to_string())
+            let int = u16::from_le_bytes([buf[1], buf[2]]);
+            // First byte indicated that a 16 bit integer follows
+            Ok((3, int.to_string()))
         }
         2 => {
-            let length_of_string = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
-            let string = std::str::from_utf8(&buf[5..length_of_string as usize + 5])
-                .map_err(|_| anyhow::anyhow!("Invalid string"))?;
-            // Add 4 for the first 4 bytes needed to calculate the length
-            (length_of_string as u64 + 4, string.to_string())
+            // First byte indicated that a 32 bit integer follows
+            let int = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+            Ok((5, int.to_string()))
         }
         3 => {
-            let next_5_bits = buf[0] & 0x3F;
-            match next_5_bits {
-                0 => {
-                    let int = buf[1];
-                    // First byte indicated that an 8 bit integer follows
-                    (2, int.to_string())
-                }
-                1 => {
-                    let int = u16::from_le_bytes([buf[1], buf[2]]);
-                    // First byte indicated that a 16 bit integer follows
-                    (3, int.to_string())
-                }
-                2 => {
-                    // First byte indicated that a 32 bit integer follows
-                    let int = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
-                    (5, int.to_string())
-                }
-                3 => {
-                    // compressed LZF string
-                    unimplemented!();
-                }
-                _ => {
-                    return Err(anyhow::anyhow!("Invalid string"));
-                }
-            }
+            // compressed LZF string
+            unimplemented!();
         }
-        _ => {
-            return Err(anyhow::anyhow!("Invalid string"));
+        _ => Err(anyhow::anyhow!("Invalid string")),
+    }
+}
+
+fn read_length_and_encoding(buf: &[u8]) -> Result<(u64, u64, bool)> {
+    // returns length, number of bytes read, and whether the string is encoded
+    let most_significant_2_bits = buf[0] >> 6;
+    let mut is_encoded = false;
+
+    match most_significant_2_bits {
+        0 => {
+            // 6 bits of length
+            let length = buf[0] & 0x3F;
+            Ok((length as u64, 1, is_encoded))
         }
-    };
-    Ok((length_of_string, string))
+        1 => {
+            // 14 bits of length
+            let length = (((buf[0] & 0x3F) as u16) << 8) | buf[1] as u16;
+            Ok((length as u64, 2, is_encoded))
+        }
+        2 => {
+            // 32 bits of length
+            let length = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+            Ok((length as u64, 5, is_encoded))
+        }
+        3 => {
+            // 6 bits of encoding
+            is_encoded = true;
+            let encoding = buf[0] & 0x3F;
+            Ok((encoding as u64, 0, is_encoded))
+        }
+        _ => Err(anyhow::anyhow!("Invalid string")),
+    }
 }
 
 #[cfg(test)]
