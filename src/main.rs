@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rdb_file::parse_rdb_file_at_path;
 use serializer::{parse_resp_data, RespData};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,11 +9,13 @@ use time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::Sender;
+use tokio::sync::mpsc;
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{sleep, timeout};
+
+mod rdb_file;
 mod serializer;
 mod utils;
-use tokio::sync::mpsc;
 
 struct StoredValue {
     value: String,
@@ -59,7 +62,7 @@ async fn main() -> Result<()> {
     if let Some(pos) = dir_flag_position {
         rdb_file_dir = Some(args[pos + 1].clone());
     }
-    let rdb_file_name_flag_position = args.iter().position(|s| s == "--rdb");
+    let rdb_file_name_flag_position = args.iter().position(|s| s == "--dbfilename");
     if let Some(pos) = rdb_file_name_flag_position {
         rdb_file_name = Some(args[pos + 1].clone());
     }
@@ -471,6 +474,35 @@ async fn read_and_handle_single_command_from_local_buffer(
                 }
                 _ => {
                     return Err(anyhow::anyhow!("Invalid argument for CONFIG GET"));
+                }
+            }
+        }
+        "keys" => {
+            println!("dir: {:?}", rdb_file_dir);
+            println!("name: {:?}", rdb_file_name);
+            let rdb_file_path_str = format!("{}/{}", rdb_file_dir.unwrap(), rdb_file_name.unwrap());
+            let rdb_file_result = parse_rdb_file_at_path(&rdb_file_path_str);
+            println!("finished parsing rdb file");
+            match rdb_file_result {
+                Ok(rdb_file) => {
+                    let keys = rdb_file.key_value_mapping.keys();
+                    println!("keys: {:?}", keys);
+                    // response with a RESP array of all the keys encoded as bulk strings
+                    let keys_resp = keys
+                        .map(|key| RespData::BulkString(key.clone()))
+                        .collect::<Vec<RespData>>();
+                    let array_resp = RespData::Array(keys_resp);
+                    stream
+                        .write_all(array_resp.serialize_to_redis_protocol().as_bytes())
+                        .await?;
+                }
+                Err(e) => {
+                    println!("Error parsing RDB file: {}", e);
+                    // respond with empty array
+                    let empty_array_resp = RespData::Array(Vec::new());
+                    stream
+                        .write_all(empty_array_resp.serialize_to_redis_protocol().as_bytes())
+                        .await?;
                 }
             }
         }
