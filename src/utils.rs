@@ -4,6 +4,8 @@ use std::hash::{BuildHasher, Hasher};
 use std::io;
 use tokio::net::TcpStream;
 
+use crate::structs::{StreamEntryResult, StreamType};
+
 pub fn get_random_string(len: usize) -> String {
     let mut random_string = String::new();
     for _ in 0..len {
@@ -49,4 +51,66 @@ pub fn clear_read_buffer_from_tcp_stream(stream: &mut TcpStream) {
             }
         }
     }
+}
+
+pub fn validate_and_generate_entry_id(
+    stream: &StreamType,
+    entry_id: String,
+) -> Result<StreamEntryResult> {
+    let mut entry_exists = false;
+    let latest_entry_id = if let Some(stream_last) = stream.last() {
+        entry_exists = true;
+        stream_last.0.clone()
+    } else {
+        "0-0".to_string()
+    };
+
+    let latest_entry_id_parts: Vec<&str> = latest_entry_id.split('-').collect();
+    let new_entry_id_parts = entry_id.split('-').collect::<Vec<&str>>();
+
+    let latest_entry_id_timestamp = latest_entry_id_parts[0].parse::<u64>()?;
+    let latest_entry_id_sequence = latest_entry_id_parts[1].parse::<u64>()?;
+    let new_entry_id_timestamp = new_entry_id_parts[0].parse::<u64>()?;
+
+    let latest_entry_id_sequence_matching_timestamp: Option<u64> =
+        if new_entry_id_timestamp <= latest_entry_id_timestamp {
+            Some(latest_entry_id_sequence)
+        } else {
+            None
+        };
+
+    let new_entry_id_sequence = if new_entry_id_parts[1] == "*" {
+        if let Some(entry_id) = latest_entry_id_sequence_matching_timestamp {
+            entry_id + 1
+        } else {
+            match new_entry_id_timestamp {
+                0 => 1,
+                _ => 0,
+            }
+        }
+    } else {
+        new_entry_id_parts[1].parse::<u64>()?
+    };
+    println!("new entry id sequence: {}", new_entry_id_sequence);
+
+    let error_msg = if new_entry_id_timestamp <= 0 && new_entry_id_sequence <= 0 {
+        "-ERR The ID specified in XADD must be greater than 0-0\r\n"
+    } else {
+        "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"
+    };
+    println!(
+        "new entry id timestamp: {}, latest entry id timestamp: {}",
+        new_entry_id_timestamp, latest_entry_id_timestamp
+    );
+    if new_entry_id_timestamp < latest_entry_id_timestamp {
+        return Ok(StreamEntryResult::ErrorMessage(error_msg.to_string()));
+    } else if new_entry_id_timestamp == latest_entry_id_timestamp {
+        let latest_entry_id_sequence = latest_entry_id_parts[1].parse::<u64>()?;
+        if new_entry_id_sequence <= latest_entry_id_sequence {
+            return Ok(StreamEntryResult::ErrorMessage(error_msg.to_string()));
+        }
+    }
+    let new_entry_id = format!("{}-{}", new_entry_id_timestamp, new_entry_id_sequence);
+    println!("new entry id: {}", new_entry_id);
+    Ok(StreamEntryResult::EntryId(new_entry_id))
 }

@@ -15,6 +15,11 @@ pub enum Value {
     Stream(StreamType),
 }
 
+pub enum StreamEntryResult {
+    ErrorMessage(String),
+    EntryId(String),
+}
+
 pub struct StoredValue {
     pub value: Value,
     pub expiry: Option<Instant>,
