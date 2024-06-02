@@ -1,6 +1,8 @@
 use anyhow::Result;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+use std::io;
+use tokio::net::TcpStream;
 
 pub fn get_random_string(len: usize) -> String {
     let mut random_string = String::new();
@@ -25,4 +27,26 @@ pub fn decode_hex_string(hex: &str) -> Result<Vec<u8>> {
     }
 
     Ok(binary_data)
+}
+
+pub fn clear_read_buffer_from_tcp_stream(stream: &mut TcpStream) {
+    let mut buf = [0; 512];
+    loop {
+        match stream.try_read(&mut buf) {
+            Ok(0) => {
+                break;
+            }
+            Ok(_) => {
+                continue;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                println!("Would block");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Error reading from socket: {}", e);
+                break;
+            }
+        }
+    }
 }
