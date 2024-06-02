@@ -1,7 +1,7 @@
 use anyhow::Result;
 use commands::{
     handle_get_command, handle_psync_command, handle_set_command, handle_type_command,
-    handle_wait_command, handle_xadd_command,
+    handle_wait_command, handle_xadd_command, handle_xrange_command,
 };
 use rdb_file::parse_rdb_file_at_path;
 use serializer::{parse_resp_data, RespData};
@@ -437,8 +437,10 @@ async fn read_and_handle_single_command_from_local_buffer(
             handle_type_command(stream, storage.clone(), &resp).await?;
         }
         "xadd" => handle_xadd_command(stream, storage.clone(), &resp).await?,
+        "xrange" => {
+            handle_xrange_command(stream, storage.clone(), &resp).await?;
+        }
         _ => {
-            println!("Unknown command");
             // slaves receive the FULLRESYNC command from the master
             // as well as the RDB file which we don't want to respond to with an error
             // so just ignore unknown commands for slaves for now

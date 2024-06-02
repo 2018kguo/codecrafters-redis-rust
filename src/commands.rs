@@ -1,4 +1,4 @@
-use crate::serializer::{parse_resp_data, RespData};
+use crate::serializer::{parse_resp_data, serialize_stream_to_resp_data, RespData};
 use crate::structs::{ServerInfo, ServerMessageChannels, StoredValue, StreamEntryResult, Value};
 use crate::utils::{self, validate_and_generate_entry_id};
 use anyhow::Result;
@@ -280,7 +280,6 @@ pub async fn handle_xadd_command(
             value: Value::Stream(stream),
             ..
         }) => {
-            let mut stream = stream.clone();
             let stream_entry_result =
                 validate_and_generate_entry_id(&stream, entry_id.to_string())?;
             match stream_entry_result {
@@ -289,30 +288,16 @@ pub async fn handle_xadd_command(
                 }
                 StreamEntryResult::EntryId(new_entry_id) => {
                     stream.push((new_entry_id.to_string(), vec![(key, value)]));
-                    held_storage.insert(
-                        stream_name,
-                        StoredValue {
-                            value: Value::Stream(stream),
-                            expiry: None,
-                        },
-                    );
+                    //held_storage.insert(
+                    //    stream_name,
+                    //    StoredValue {
+                    //        value: Value::Stream(stream),
+                    //        expiry: None,
+                    //    },
+                    //);
                     StreamEntryResult::EntryId(new_entry_id.to_string())
                 }
             }
-            //            if let StreamEntryResult::ErrorMessage(error_msg) = stream_entry_result
-            //            {
-            //                StreamEntryResult::ErrorMessage(error_msg)
-            //            } else {
-            //                stream.push((entry_id.to_string(), vec![(key, value)]));
-            //                held_storage.insert(
-            //                    stream_name,
-            //                    StoredValue {
-            //                        value: Value::Stream(stream),
-            //                        expiry: None,
-            //                    },
-            //                );
-            //                StreamEntryResult::EntryId(entry_id.to_string())
-            //            }
         }
         _ => {
             let stream_entry_result =
@@ -335,19 +320,6 @@ pub async fn handle_xadd_command(
                     StreamEntryResult::EntryId(new_entry_id.to_string())
                 }
             }
-            //            if let StreamEntryResult::ErrorMessage(error_msg) = stream_entry_result
-            //            {
-            //                StreamEntryResult::ErrorMessage(error_msg)
-            //            } else {
-            //                held_storage.insert(
-            //                    stream_name,
-            //                    StoredValue {
-            //                        value: Value::Stream(vec![(entry_id.to_string(), vec![(key, value)])]),
-            //                        expiry: None,
-            //                    },
-            //                );
-            //                StreamEntryResult::EntryId(entry_id.to_string())
-            //            }
         }
     };
     match entry_result {
@@ -362,6 +334,37 @@ pub async fn handle_xadd_command(
                 .await?;
         }
     }
+    Ok(())
+}
+
+pub async fn handle_xrange_command(
+    tcp_stream: &mut TcpStream,
+    storage: Arc<Mutex<HashMap<String, StoredValue>>>,
+    resp: &RespData,
+) -> Result<()> {
+    let args = resp.serialize_to_list_of_strings(true);
+    let stream_key = &args[1];
+    let min_entry_id = &args[2];
+    let max_entry_id = &args[3];
+
+    let storage = storage.lock().await;
+    match storage.get(stream_key) {
+        Some(StoredValue {
+            value: Value::Stream(stream),
+            ..
+        }) => {
+            println!("max entry id: {}", max_entry_id);
+            let resp_data =
+                serialize_stream_to_resp_data(stream, Some(min_entry_id), Some(max_entry_id));
+            tcp_stream
+                .write_all(resp_data.serialize_to_redis_protocol().as_bytes())
+                .await?;
+        }
+        _ => {
+            tcp_stream.write_all("$-1\r\n".as_bytes()).await?;
+            return Ok(());
+        }
+    };
     Ok(())
 }
 

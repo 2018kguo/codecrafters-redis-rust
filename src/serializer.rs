@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 
+use crate::{structs::StreamType, utils::compare_stream_entry_ids};
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum RespData {
     SimpleString(String),
@@ -148,6 +150,58 @@ fn read_until_crlf(buffer: &[u8]) -> Option<(&[u8], usize)> {
         }
     }
     None
+}
+
+pub fn serialize_stream_to_resp_data(
+    stream: &StreamType,
+    min_entry_id: Option<&str>,
+    max_entry_id: Option<&str>,
+) -> RespData
+// returns a resp array of arrays,
+    // [
+    //  [
+    //    "1526985054069-0",
+    //    [
+    //      "temperature",
+    //      "36",
+    //      "humidity",
+    //      "95"
+    //    ]
+    //  ],
+    //  [
+    //    "1526985054079-0",
+    //    [
+    //      "temperature",
+    //      "37",
+    //      "humidity",
+    //      "94"
+    //    ]
+    //  ],
+{
+    let mut resp_array = Vec::new();
+    for entry in stream {
+        let mut entry_array = Vec::new();
+        entry_array.push(RespData::BulkString(entry.0.clone()));
+        let mut entry_data = Vec::new();
+        let entry_key = &entry.0.as_str();
+
+        let is_ge_than_min = min_entry_id.is_none()
+            || (compare_stream_entry_ids(min_entry_id.unwrap(), entry_key) <= 0);
+        let is_le_than_max = max_entry_id.is_none()
+            || (compare_stream_entry_ids(entry_key, max_entry_id.unwrap()) <= 0);
+
+        if !(is_ge_than_min && is_le_than_max) {
+            continue;
+        }
+
+        for (key, value) in entry.1.as_slice() {
+            entry_data.push(RespData::BulkString(key.to_string()));
+            entry_data.push(RespData::BulkString(value.to_string()));
+        }
+        entry_array.push(RespData::Array(entry_data));
+        resp_array.push(RespData::Array(entry_array));
+    }
+    RespData::Array(resp_array)
 }
 
 #[cfg(test)]

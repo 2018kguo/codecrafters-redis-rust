@@ -124,3 +124,29 @@ pub fn validate_and_generate_entry_id(
     println!("new entry id: {}", new_entry_id);
     Ok(StreamEntryResult::EntryId(new_entry_id))
 }
+
+pub fn compare_stream_entry_ids(e1: &str, e2: &str) -> i8 {
+    let e1_parts: Vec<&str> = e1.split('-').collect();
+    let e2_parts: Vec<&str> = e2.split('-').collect();
+
+    //println!("e1_parts: {:?}, e2_parts: {:?}", e1_parts, e2_parts);
+    let e1_timestamp = e1_parts[0].parse::<u64>().unwrap();
+    let e2_timestamp = e2_parts[0].parse::<u64>().unwrap();
+
+    let e1_sequence = e1_parts[1].parse::<u64>().unwrap();
+    let e2_sequence = e2_parts[1].parse::<u64>().unwrap();
+
+    if e1_timestamp < e2_timestamp {
+        return -1;
+    } else if e1_timestamp > e2_timestamp {
+        return 1;
+    } else {
+        if e1_sequence < e2_sequence {
+            return -1;
+        } else if e1_sequence > e2_sequence {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+}
