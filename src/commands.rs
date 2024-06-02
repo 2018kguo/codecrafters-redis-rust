@@ -1,4 +1,4 @@
-use crate::serializer::{parse_resp_data, serialize_stream_to_resp_data, RespData};
+use crate::serializer::{filter_and_serialize_stream_to_resp_data, parse_resp_data, RespData};
 use crate::structs::{ServerInfo, ServerMessageChannels, StoredValue, StreamEntryResult, Value};
 use crate::utils::{self, validate_and_generate_entry_id};
 use anyhow::Result;
@@ -354,8 +354,11 @@ pub async fn handle_xrange_command(
             ..
         }) => {
             println!("max entry id: {}", max_entry_id);
-            let resp_data =
-                serialize_stream_to_resp_data(stream, Some(min_entry_id), Some(max_entry_id));
+            let resp_data = filter_and_serialize_stream_to_resp_data(
+                stream,
+                Some(min_entry_id),
+                Some(max_entry_id),
+            );
             tcp_stream
                 .write_all(resp_data.serialize_to_redis_protocol().as_bytes())
                 .await?;

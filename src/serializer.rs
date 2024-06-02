@@ -152,7 +152,7 @@ fn read_until_crlf(buffer: &[u8]) -> Option<(&[u8], usize)> {
     None
 }
 
-pub fn serialize_stream_to_resp_data(
+pub fn filter_and_serialize_stream_to_resp_data(
     stream: &StreamType,
     min_entry_id: Option<&str>,
     max_entry_id: Option<&str>,
@@ -186,8 +186,10 @@ pub fn serialize_stream_to_resp_data(
         let entry_key = &entry.0.as_str();
 
         let is_ge_than_min = min_entry_id.is_none()
+            || min_entry_id.unwrap() == "-"
             || (compare_stream_entry_ids(min_entry_id.unwrap(), entry_key) <= 0);
         let is_le_than_max = max_entry_id.is_none()
+            || max_entry_id.unwrap() == "+"
             || (compare_stream_entry_ids(entry_key, max_entry_id.unwrap()) <= 0);
 
         if !(is_ge_than_min && is_le_than_max) {
