@@ -1,7 +1,7 @@
 use anyhow::Result;
 use commands::{
     handle_get_command, handle_psync_command, handle_set_command, handle_type_command,
-    handle_wait_command, handle_xadd_command, handle_xrange_command,
+    handle_wait_command, handle_xadd_command, handle_xrange_command, handle_xread_command,
 };
 use rdb_file::parse_rdb_file_at_path;
 use serializer::{parse_resp_data, RespData};
@@ -439,6 +439,9 @@ async fn read_and_handle_single_command_from_local_buffer(
         "xadd" => handle_xadd_command(stream, storage.clone(), &resp).await?,
         "xrange" => {
             handle_xrange_command(stream, storage.clone(), &resp).await?;
+        }
+        "xread" => {
+            handle_xread_command(stream, storage.clone(), &resp).await?;
         }
         _ => {
             // slaves receive the FULLRESYNC command from the master

@@ -152,7 +152,7 @@ fn read_until_crlf(buffer: &[u8]) -> Option<(&[u8], usize)> {
     None
 }
 
-pub fn filter_and_serialize_stream_to_resp_data(
+pub fn filter_and_serialize_stream_to_resp_data_xrange_format(
     stream: &StreamType,
     min_entry_id: Option<&str>,
     max_entry_id: Option<&str>,
@@ -202,6 +202,63 @@ pub fn filter_and_serialize_stream_to_resp_data(
         }
         entry_array.push(RespData::Array(entry_data));
         resp_array.push(RespData::Array(entry_array));
+    }
+    RespData::Array(resp_array)
+}
+
+pub fn filter_and_serialize_stream_to_resp_data_xread_format(
+    streams_and_min_entry_ids: Vec<(&str, &StreamType, Option<&str>)>,
+) -> RespData {
+    // returns data in the following format w/ the stream key included
+    //[
+    //  [
+    //    "stream_key",
+    //    [
+    //      [
+    //        "0-1",
+    //        [
+    //          "temperature",
+    //          "96"
+    //        ]
+    //      ]
+    //    ]
+    //  ]
+    //]
+    let mut resp_array = Vec::new();
+    for (stream_key, stream, min_entry_id) in streams_and_min_entry_ids {
+        let mut stream_array = Vec::new();
+        let mut entries_array = Vec::new();
+        // add stream_key
+        stream_array.push(RespData::BulkString(stream_key.to_string()));
+        for entry in stream {
+            let mut entry_array = Vec::new();
+
+            let mut entry_data = Vec::new();
+            //entry_data.push(RespData::BulkString(entry.0.clone()));
+            let entry_key = &entry.0.as_str();
+
+            let is_ge_than_min = min_entry_id.is_none()
+                || min_entry_id.unwrap() == "-"
+                || (compare_stream_entry_ids(min_entry_id.unwrap(), entry_key) <= 0);
+
+            if !is_ge_than_min {
+                continue;
+            }
+
+            // add the entry id, i.e "0-1"
+            entry_array.push(RespData::BulkString(entry.0.clone()));
+
+            for (key, value) in entry.1.as_slice() {
+                // add the key-value pairs
+                entry_data.push(RespData::BulkString(key.to_string()));
+                entry_data.push(RespData::BulkString(value.to_string()));
+            }
+            entry_array.push(RespData::Array(entry_data));
+            entries_array.push(RespData::Array(entry_array));
+            //stream_array.push(RespData::Array(entry_array));
+        }
+        stream_array.push(RespData::Array(entries_array));
+        resp_array.push(RespData::Array(stream_array));
     }
     RespData::Array(resp_array)
 }

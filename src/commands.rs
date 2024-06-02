@@ -1,4 +1,7 @@
-use crate::serializer::{filter_and_serialize_stream_to_resp_data, parse_resp_data, RespData};
+use crate::serializer::{
+    filter_and_serialize_stream_to_resp_data_xrange_format,
+    filter_and_serialize_stream_to_resp_data_xread_format, parse_resp_data, RespData,
+};
 use crate::structs::{ServerInfo, ServerMessageChannels, StoredValue, StreamEntryResult, Value};
 use crate::utils::{self, validate_and_generate_entry_id};
 use anyhow::Result;
@@ -354,11 +357,49 @@ pub async fn handle_xrange_command(
             ..
         }) => {
             println!("max entry id: {}", max_entry_id);
-            let resp_data = filter_and_serialize_stream_to_resp_data(
+            let resp_data = filter_and_serialize_stream_to_resp_data_xrange_format(
                 stream,
                 Some(min_entry_id),
                 Some(max_entry_id),
             );
+            tcp_stream
+                .write_all(resp_data.serialize_to_redis_protocol().as_bytes())
+                .await?;
+        }
+        _ => {
+            tcp_stream.write_all("$-1\r\n".as_bytes()).await?;
+            return Ok(());
+        }
+    };
+    Ok(())
+}
+
+pub async fn handle_xread_command(
+    tcp_stream: &mut TcpStream,
+    storage: Arc<Mutex<HashMap<String, StoredValue>>>,
+    resp: &RespData,
+) -> Result<()> {
+    // XREAD streams stream_key 0-0
+    let args = resp.serialize_to_list_of_strings(true);
+    let stream_arg = &args[1];
+
+    if stream_arg != "streams" {
+        unimplemented!();
+    }
+
+    let stream_key = &args[2];
+    let min_entry_id = &args[3];
+
+    let storage = storage.lock().await;
+    match storage.get(stream_key) {
+        Some(StoredValue {
+            value: Value::Stream(stream),
+            ..
+        }) => {
+            let streams_and_min_entry_ids =
+                vec![(stream_key.as_str(), stream, Some(min_entry_id.as_str()))];
+            let resp_data =
+                filter_and_serialize_stream_to_resp_data_xread_format(streams_and_min_entry_ids);
             tcp_stream
                 .write_all(resp_data.serialize_to_redis_protocol().as_bytes())
                 .await?;
