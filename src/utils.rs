@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
-use std::io;
+use std::{io, time};
 use tokio::net::TcpStream;
 
 use crate::structs::{StreamEntryResult, StreamType};
@@ -57,20 +57,30 @@ pub fn validate_and_generate_entry_id(
     stream: &StreamType,
     entry_id: String,
 ) -> Result<StreamEntryResult> {
-    let mut entry_exists = false;
     let latest_entry_id = if let Some(stream_last) = stream.last() {
-        entry_exists = true;
         stream_last.0.clone()
     } else {
         "0-0".to_string()
     };
 
     let latest_entry_id_parts: Vec<&str> = latest_entry_id.split('-').collect();
-    let new_entry_id_parts = entry_id.split('-').collect::<Vec<&str>>();
+
+    let new_entry_id_parts = if entry_id == "*" {
+        vec!["*", "*"]
+    } else {
+        entry_id.split('-').collect::<Vec<&str>>()
+    };
 
     let latest_entry_id_timestamp = latest_entry_id_parts[0].parse::<u64>()?;
     let latest_entry_id_sequence = latest_entry_id_parts[1].parse::<u64>()?;
-    let new_entry_id_timestamp = new_entry_id_parts[0].parse::<u64>()?;
+    let new_entry_id_timestamp = if new_entry_id_parts[0] == "*" {
+        // use the current unix time in milliseconds as the timestamp
+        time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)?
+            .as_millis() as u64
+    } else {
+        new_entry_id_parts[0].parse::<u64>()?
+    };
 
     let latest_entry_id_sequence_matching_timestamp: Option<u64> =
         if new_entry_id_timestamp <= latest_entry_id_timestamp {
