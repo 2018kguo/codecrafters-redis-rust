@@ -13,12 +13,20 @@ use tokio::sync::mpsc;
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{sleep, timeout};
 
+mod commands;
 mod rdb_file;
 mod serializer;
 mod utils;
 
+#[derive(Clone, Debug, PartialEq)]
+enum Value {
+    String(String),
+    // a stream consists of multiple entires which in turn consist of multiple key-value pairs
+    Stream(Vec<(String, Vec<(String, String)>)>),
+}
+
 pub struct StoredValue {
-    value: String,
+    value: Value,
     expiry: Option<Instant>,
 }
 
@@ -94,7 +102,7 @@ async fn main() -> Result<()> {
                 let expiry = value_plus_expiry.1;
                 println!("Key: {}, Value: {}, expiry: {:?}", key, value, expiry);
                 let stored_value = StoredValue {
-                    value: value.to_string(),
+                    value: Value::String(value.to_string()),
                     expiry,
                 };
                 storage.lock().await.insert(key.to_string(), stored_value);
@@ -388,104 +396,23 @@ async fn read_and_handle_single_command_from_local_buffer(
             .await?;
         }
         "wait" => {
-            if is_replica {
-                return Err(anyhow::anyhow!("WAIT command not expected for replicas"));
-            }
-
-            let args = RespData::unpack_array(&resp);
-            let num_replicas_arg = args[1].serialize_to_list_of_strings(false)[0]
-                .clone()
-                .parse::<usize>()?;
-            let wait_timeout_arg = args[2].serialize_to_list_of_strings(false)[0]
-                .clone()
-                .parse::<usize>()?;
-            let timeout_instant = Instant::now() + Duration::from_millis(wait_timeout_arg as u64);
-
-            let replica_addresses = {
-                let server_info = server_info.lock().await;
-                server_info.replica_addresses.clone()
-            };
-
-            let mut wait_rc_locked = message_channels.wait_rc.lock().await;
-            // Discard all messages currently in the broadcast channel
-            while wait_rc_locked.try_recv().is_ok() {
-                continue;
-            }
-
-            let mut getack_bytes_to_add_to_master_offset = 0;
-            //let mut getack_bytes_to_add_to_master_offset = 0;
-            let num_synced_replicas = if master_repl_offset == 0 {
-                replica_addresses.len()
-            } else {
-                // send GETACK to all replicas and wait for them to acknowledge
-                // or wait for a timeout:
-                let mut synced_counter = 0;
-                let getack_command = RespData::Array(vec![
-                    RespData::BulkString("REPLCONF".to_string()),
-                    RespData::BulkString("GETACK".to_string()),
-                    RespData::BulkString("*".to_string()),
-                ]);
-                let bytes = getack_command
-                    .serialize_to_redis_protocol()
-                    .as_bytes()
-                    .to_vec();
-                let mut is_initial_iteration = true;
-                while Instant::now() < timeout_instant {
-                    // TODO: after sending the messages on this broadcast channel,
-                    // listen to their responses and read their offsets
-                    if synced_counter >= num_replicas_arg {
-                        break;
-                    }
-                    if is_initial_iteration {
-                        // send the GETACK command to all replicas
-                        //
-                        // it seemed to be problematic to send multiple copies of GETACK because
-                        // in the test cases, after a SET command is sent to the master the
-                        // replicas are expected to receive the SET command as their next immediate
-                        // message. If there was a backlogged GETACK command then the SET command
-                        // would be second in line and it would fail. Honestly not sure if this is
-                        // a quirk in the test cases or if I'm doing something wrong.
-                        message_channels.sender.send(bytes.clone())?;
-                        getack_bytes_to_add_to_master_offset += bytes.len();
-                    }
-                    is_initial_iteration = false;
-
-                    sleep(Duration::from_millis(50)).await;
-
-                    while let Ok(offset) = wait_rc_locked.try_recv() {
-                        println!(
-                            "Received offset from replica: {}, master repl offset is {}",
-                            offset, master_repl_offset
-                        );
-                        if offset >= (master_repl_offset as u64) {
-                            synced_counter += 1;
-                        }
-                        if synced_counter >= num_replicas_arg {
-                            break;
-                        }
-                    }
-                }
-                synced_counter
-            };
-            println!("Number of synced replicas: {}", num_synced_replicas);
-            let integer_resp = RespData::Integer(num_synced_replicas as isize);
-            stream
-                .write_all(integer_resp.serialize_to_redis_protocol().as_bytes())
-                .await?;
-            // increment the master_repl_offset by the number of bytes in the GETACK command
-            // I _think_ you're supposed to do this but tests pass either way so whatever
-            {
-                let mut server_info = server_info.lock().await;
-                server_info.master_repl_offset += getack_bytes_to_add_to_master_offset;
-            }
+            handle_wait_command(
+                stream,
+                &resp,
+                server_info.clone(),
+                message_channels,
+                master_repl_offset,
+                is_replica,
+            )
+            .await?;
         }
         "config" => {
-            let config_resp = RespData::unpack_array(&resp);
-            let subcommand = config_resp[1].serialize_to_list_of_strings(true)[0].clone();
+            let config_resp = resp.serialize_to_list_of_strings(true);
+            let subcommand = &config_resp[1];
             if subcommand != "get" {
                 return Err(anyhow::anyhow!("Only the CONFIG GET command is supported"));
             }
-            let get_arg = config_resp[2].serialize_to_list_of_strings(true)[0].clone();
+            let get_arg = &config_resp[2];
             match get_arg.as_str() {
                 "dir" => {
                     // respond with a RESP array of dir and the value
@@ -540,6 +467,7 @@ async fn read_and_handle_single_command_from_local_buffer(
         "type" => {
             handle_type_command(stream, storage.clone(), &resp).await?;
         }
+        "xadd" => handle_xadd_command(stream, storage.clone(), &resp).await?,
         _ => {
             println!("Unknown command");
             // slaves receive the FULLRESYNC command from the master
@@ -679,10 +607,14 @@ async fn handle_get_command(
             if stored_value.expiry.is_none() || stored_value.expiry.unwrap() > Instant::now() =>
         {
             let string_value = stored_value.value.clone();
-            let resp_response = RespData::SimpleString(string_value);
-            stream
-                .write_all(resp_response.serialize_to_redis_protocol().as_bytes())
-                .await?;
+            if let Value::String(string_value) = string_value {
+                let resp_response = RespData::SimpleString(string_value);
+                stream
+                    .write_all(resp_response.serialize_to_redis_protocol().as_bytes())
+                    .await?;
+            } else {
+                unimplemented!();
+            }
         }
         // Key has either expired or never existed in the map.
         _ => {
@@ -705,7 +637,10 @@ async fn handle_type_command(
         Some(stored_value)
             if stored_value.expiry.is_none() || stored_value.expiry.unwrap() > Instant::now() =>
         {
-            "string"
+            match stored_value.value {
+                Value::String(_) => "string",
+                Value::Stream(_) => "stream",
+            }
         }
         // Key has either expired or never existed in the map.
         _ => "none",
@@ -727,24 +662,22 @@ async fn handle_set_command(
     handshake_with_master_complete: bool,
     server_info: Arc<Mutex<ServerInfo>>,
 ) -> Result<()> {
-    let set_resp = RespData::unpack_array(&resp);
+    let set_resp = resp.serialize_to_list_of_strings(false);
     // the second element in the array is the key
-    let key_str = set_resp[1].serialize_to_list_of_strings(false)[0].clone();
+    let key_str = &set_resp[1];
     // the third element in the array is the value
-    let value_str = set_resp[2].serialize_to_list_of_strings(false)[0].clone();
+    let value_str = &set_resp[2];
     // px argument is being provided
     if set_resp.len() > 3 {
-        let arg = set_resp[3].serialize_to_list_of_strings(true)[0].clone();
+        let arg = &set_resp[3];
         if arg == "px" {
-            let expiry_milliseconds: usize = set_resp[4].serialize_to_list_of_strings(false)[0]
-                .clone()
-                .parse()?;
+            let expiry_milliseconds: usize = set_resp[4].clone().parse()?;
             let expiry = Instant::now() + Duration::from_millis(expiry_milliseconds as u64);
             let mut held_storage = storage.lock().await;
             held_storage.insert(
-                key_str,
+                key_str.to_string(),
                 StoredValue {
-                    value: value_str,
+                    value: Value::String(value_str.to_string()),
                     expiry: Some(expiry),
                 },
             );
@@ -754,9 +687,9 @@ async fn handle_set_command(
     } else {
         let mut held_storage = storage.lock().await;
         held_storage.insert(
-            key_str,
+            key_str.to_string(),
             StoredValue {
-                value: value_str,
+                value: Value::String(value_str.to_string()),
                 expiry: None,
             },
         );
@@ -799,9 +732,9 @@ async fn handle_psync_command(
     server_info: Arc<Mutex<ServerInfo>>,
     wait_tx: Arc<Mutex<mpsc::Sender<u64>>>,
 ) -> Result<()> {
-    let psync_resp = RespData::unpack_array(resp);
-    let _replication_id = psync_resp[1].serialize_to_list_of_strings(false)[0].clone();
-    let _offset = psync_resp[2].serialize_to_list_of_strings(false)[0].clone();
+    let psync_resp = resp.serialize_to_list_of_strings(false);
+    let _replication_id = &psync_resp[1];
+    let _offset = &psync_resp[2];
 
     let full_resync_response = RespData::SimpleString(format!(
         "+FULLRESYNC {} {}",
@@ -888,17 +821,13 @@ async fn handle_psync_command(
                 continue;
             }
             let (resp, _) = parse_resp_data(&bytes_read_vec)?;
-            let offset_resp = RespData::unpack_array(&resp);
+            let offset_resp = resp.serialize_to_list_of_strings(true);
             // we expect to get REPLCONF ACK <offset> as a response
-            if !(offset_resp.len() == 3
-                && offset_resp[0] == RespData::BulkString("REPLCONF".to_string())
-                && offset_resp[1] == RespData::BulkString("ACK".to_string()))
+            if !(offset_resp.len() == 3 && offset_resp[0] == "replconf" && offset_resp[1] == "ack")
             {
                 anyhow::bail!("Unexpected response from replica");
             }
-            let offset = offset_resp[2].serialize_to_list_of_strings(false)[0]
-                .clone()
-                .parse::<usize>()?;
+            let offset = offset_resp[2].clone().parse::<usize>()?;
             // send the replica's offset back upstreawm to the thread thats handling the WAIT
             // command via the mpsc channel
             let u64_offset = offset.try_into().unwrap();
@@ -911,6 +840,148 @@ async fn handle_psync_command(
             replica_command, is_wait_command
         );
     }
+}
+
+async fn handle_xadd_command(
+    stream: &mut TcpStream,
+    storage: Arc<Mutex<HashMap<String, StoredValue>>>,
+    resp: &RespData,
+) -> Result<()> {
+    // XADD stream_name * key value
+    let args = resp.serialize_to_list_of_strings(true);
+    let stream_name = args[1].clone();
+    let entry_id = args[2].clone();
+    let key = args[3].clone();
+    let value = args[4].clone();
+
+    let mut held_storage = storage.lock().await;
+    match held_storage.get_mut(&stream_name) {
+        Some(StoredValue {
+            value: Value::Stream(stream),
+            ..
+        }) => {
+            let mut stream = stream.clone();
+            stream.push((entry_id.clone(), vec![(key, value)]));
+            held_storage.insert(
+                stream_name,
+                StoredValue {
+                    value: Value::Stream(stream),
+                    expiry: None,
+                },
+            );
+        }
+        _ => {
+            held_storage.insert(
+                stream_name,
+                StoredValue {
+                    value: Value::Stream(vec![(entry_id.clone(), vec![(key, value)])]),
+                    expiry: None,
+                },
+            );
+        }
+    }
+    let resp_response = RespData::BulkString(entry_id);
+    stream
+        .write_all(resp_response.serialize_to_redis_protocol().as_bytes())
+        .await?;
+    Ok(())
+}
+
+async fn handle_wait_command(
+    stream: &mut TcpStream,
+    resp: &RespData,
+    server_info: Arc<Mutex<ServerInfo>>,
+    message_channels: &mut ServerMessageChannels,
+    master_repl_offset: usize,
+    is_replica: bool,
+) -> Result<()> {
+    if is_replica {
+        return Err(anyhow::anyhow!("WAIT command not expected for replicas"));
+    }
+
+    let args = resp.serialize_to_list_of_strings(false);
+    let num_replicas_arg = args[1].clone().parse::<usize>()?;
+    let wait_timeout_arg = args[2].clone().parse::<usize>()?;
+    let timeout_instant = Instant::now() + Duration::from_millis(wait_timeout_arg as u64);
+
+    let replica_addresses = {
+        let server_info = server_info.lock().await;
+        server_info.replica_addresses.clone()
+    };
+
+    let mut wait_rc_locked = message_channels.wait_rc.lock().await;
+    // Discard all messages currently in the broadcast channel
+    while wait_rc_locked.try_recv().is_ok() {
+        continue;
+    }
+
+    let mut getack_bytes_to_add_to_master_offset = 0;
+    //let mut getack_bytes_to_add_to_master_offset = 0;
+    let num_synced_replicas = if master_repl_offset == 0 {
+        replica_addresses.len()
+    } else {
+        // send GETACK to all replicas and wait for them to acknowledge
+        // or wait for a timeout:
+        let mut synced_counter = 0;
+        let getack_command = RespData::Array(vec![
+            RespData::BulkString("REPLCONF".to_string()),
+            RespData::BulkString("GETACK".to_string()),
+            RespData::BulkString("*".to_string()),
+        ]);
+        let bytes = getack_command
+            .serialize_to_redis_protocol()
+            .as_bytes()
+            .to_vec();
+        let mut is_initial_iteration = true;
+        while Instant::now() < timeout_instant {
+            // TODO: after sending the messages on this broadcast channel,
+            // listen to their responses and read their offsets
+            if synced_counter >= num_replicas_arg {
+                break;
+            }
+            if is_initial_iteration {
+                // send the GETACK command to all replicas
+                //
+                // it seemed to be problematic to send multiple copies of GETACK because
+                // in the test cases, after a SET command is sent to the master the
+                // replicas are expected to receive the SET command as their next immediate
+                // message. If there was a backlogged GETACK command then the SET command
+                // would be second in line and it would fail. Honestly not sure if this is
+                // a quirk in the test cases or if I'm doing something wrong.
+                message_channels.sender.send(bytes.clone())?;
+                getack_bytes_to_add_to_master_offset += bytes.len();
+            }
+            is_initial_iteration = false;
+
+            sleep(Duration::from_millis(50)).await;
+
+            while let Ok(offset) = wait_rc_locked.try_recv() {
+                println!(
+                    "Received offset from replica: {}, master repl offset is {}",
+                    offset, master_repl_offset
+                );
+                if offset >= (master_repl_offset as u64) {
+                    synced_counter += 1;
+                }
+                if synced_counter >= num_replicas_arg {
+                    break;
+                }
+            }
+        }
+        synced_counter
+    };
+    println!("Number of synced replicas: {}", num_synced_replicas);
+    let integer_resp = RespData::Integer(num_synced_replicas as isize);
+    stream
+        .write_all(integer_resp.serialize_to_redis_protocol().as_bytes())
+        .await?;
+    // increment the master_repl_offset by the number of bytes in the GETACK command
+    // I _think_ you're supposed to do this but tests pass either way so whatever
+    {
+        let mut server_info = server_info.lock().await;
+        server_info.master_repl_offset += getack_bytes_to_add_to_master_offset;
+    }
+    Ok(())
 }
 
 fn clear_read_buffer_from_tcp_stream(stream: &mut TcpStream) {
