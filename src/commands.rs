@@ -1,5 +1,5 @@
 use crate::serializer::{parse_resp_data, RespData};
-use crate::structs::{ServerInfo, ServerMessageChannels, StoredValue, Value};
+use crate::structs::{ServerInfo, ServerMessageChannels, StoredValue, StreamType, Value};
 use crate::utils;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -263,48 +263,94 @@ pub async fn handle_psync_command(
 }
 
 pub async fn handle_xadd_command(
-    stream: &mut TcpStream,
+    tcp_stream: &mut TcpStream,
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
     resp: &RespData,
 ) -> Result<()> {
     // XADD stream_name * key value
     let args = resp.serialize_to_list_of_strings(true);
     let stream_name = args[1].clone();
-    let entry_id = args[2].clone();
+    let entry_id = &args[2].clone();
     let key = args[3].clone();
     let value = args[4].clone();
 
     let mut held_storage = storage.lock().await;
-    match held_storage.get_mut(&stream_name) {
+    let error_msg: Option<String> = match held_storage.get_mut(&stream_name) {
         Some(StoredValue {
             value: Value::Stream(stream),
             ..
         }) => {
             let mut stream = stream.clone();
-            stream.push((entry_id.clone(), vec![(key, value)]));
-            held_storage.insert(
-                stream_name,
-                StoredValue {
-                    value: Value::Stream(stream),
-                    expiry: None,
-                },
-            );
+            if let Some(error_msg) = validate_entry_id(&stream, entry_id.to_string())? {
+                Some(error_msg)
+            } else {
+                stream.push((entry_id.to_string(), vec![(key, value)]));
+                held_storage.insert(
+                    stream_name,
+                    StoredValue {
+                        value: Value::Stream(stream),
+                        expiry: None,
+                    },
+                );
+                None
+            }
         }
         _ => {
-            held_storage.insert(
-                stream_name,
-                StoredValue {
-                    value: Value::Stream(vec![(entry_id.clone(), vec![(key, value)])]),
-                    expiry: None,
-                },
-            );
+            if let Some(error_msg) = validate_entry_id(&vec![], entry_id.to_string())? {
+                Some(error_msg)
+            } else {
+                held_storage.insert(
+                    stream_name,
+                    StoredValue {
+                        value: Value::Stream(vec![(entry_id.to_string(), vec![(key, value)])]),
+                        expiry: None,
+                    },
+                );
+                None
+            }
         }
+    };
+    if let Some(error_msg) = error_msg {
+        tcp_stream.write_all(error_msg.as_bytes()).await?;
+        return Ok(());
     }
-    let resp_response = RespData::BulkString(entry_id);
-    stream
+    let resp_response = RespData::BulkString(entry_id.to_string());
+    tcp_stream
         .write_all(resp_response.serialize_to_redis_protocol().as_bytes())
         .await?;
     Ok(())
+}
+
+fn validate_entry_id(stream: &StreamType, entry_id: String) -> Result<Option<String>> {
+    let latest_entry_id = if let Some(stream_last) = stream.last() {
+        stream_last.0.clone()
+    } else {
+        "0-0".to_string()
+    };
+
+    let latest_entry_id_parts: Vec<&str> = latest_entry_id.split('-').collect();
+    let new_entry_id_parts = entry_id.split('-').collect::<Vec<&str>>();
+
+    let latest_entry_id_timestamp = latest_entry_id_parts[0].parse::<u64>()?;
+    let new_entry_id_timestamp = new_entry_id_parts[0].parse::<u64>()?;
+    let new_entry_id_sequence = new_entry_id_parts[1].parse::<u64>()?;
+
+    let error_msg = if new_entry_id_timestamp <= 0 && new_entry_id_sequence <= 0 {
+        "-ERR The ID specified in XADD must be greater than 0-0\r\n"
+    } else {
+        "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"
+    };
+    println!("new entry id timestamp: {}, latest entry id timestamp: {}", new_entry_id_timestamp, latest_entry_id_timestamp);
+    if new_entry_id_timestamp < latest_entry_id_timestamp {
+        return Ok(Some(error_msg.to_string()));
+    } else if new_entry_id_timestamp == latest_entry_id_timestamp {
+        let latest_entry_id_sequence = latest_entry_id_parts[1].parse::<u64>()?;
+        let new_entry_id_sequence = new_entry_id_parts[1].parse::<u64>()?;
+        if new_entry_id_sequence <= latest_entry_id_sequence {
+            return Ok(Some(error_msg.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 pub async fn handle_wait_command(

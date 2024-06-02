@@ -6,11 +6,13 @@ use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
+pub type StreamType = Vec<(String, Vec<(String, String)>)>;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     String(String),
     // a stream consists of multiple entires which in turn consist of multiple key-value pairs
-    Stream(Vec<(String, Vec<(String, String)>)>),
+    Stream(StreamType),
 }
 
 pub struct StoredValue {
