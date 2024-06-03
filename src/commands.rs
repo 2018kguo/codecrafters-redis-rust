@@ -403,6 +403,53 @@ pub async fn handle_xread_command(
         }
     }
 
+    // find the position of the streams argument
+    let streams_arg_pos = args.iter().position(|arg| arg == "streams").unwrap();
+
+    let mut index = streams_arg_pos + 1;
+    let mut stream_key_and_min_entry_id_list: Vec<(&str, String)> = vec![];
+    let mut num_keys = 0;
+    //XREAD streams stream_key other_stream_key 0-0 0-1
+    while index < args.len() && !args[index].contains("-") && !(args[index] == "$") {
+        println!("contents of args: {}", args[index]);
+        num_keys += 1;
+        index += 1;
+    }
+    index = streams_arg_pos + 1;
+    while index < streams_arg_pos + num_keys + 1 {
+        let stream_key = &args[index];
+        println!(
+            "num keys: {}, index: {}, streams_arg_pos: {}",
+            num_keys, index, streams_arg_pos
+        );
+        let min_entry_id = &args[index + num_keys];
+        let generated_min_entry_id: String = if min_entry_id == "$" {
+            // when this is a $ we need to substitute it with the minimum entry id in the stream
+            // that we currently have in storage
+            let storage = storage.lock().await;
+            match storage.get(stream_key) {
+                Some(StoredValue {
+                    value: Value::Stream(stream),
+                    ..
+                }) => {
+                    if stream.is_empty() {
+                        "0-0".to_string()
+                    } else {
+                        stream.iter().last().unwrap().0.clone()
+                    }
+                }
+                _ => {
+                    tcp_stream.write_all("$-1\r\n".as_bytes()).await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            min_entry_id.to_string()
+        };
+        stream_key_and_min_entry_id_list.push((stream_key, generated_min_entry_id));
+        index += 1;
+    }
+
     let mut is_first_iteration = true;
 
     loop {
@@ -412,30 +459,11 @@ pub async fn handle_xread_command(
             let block_duration = Duration::from_millis(100);
             sleep(block_duration).await;
         }
-        // find the position of the streams argument
-        let streams_arg_pos = args.iter().position(|arg| arg == "streams").unwrap();
-
-        let mut index = streams_arg_pos + 1;
-        let mut stream_key_and_min_entry_id_list: Vec<(&str, &str)> = vec![];
-        let mut num_keys = 0;
-        //XREAD streams stream_key other_stream_key 0-0 0-1
-        while index < args.len() && !args[index].contains("-") {
-            num_keys += 1;
-            index += 1;
-        }
-        index = streams_arg_pos + 1;
-        while index < streams_arg_pos + num_keys + 1 {
-            let stream_key = &args[index];
-            let min_entry_id = &args[index + num_keys];
-            stream_key_and_min_entry_id_list.push((stream_key, min_entry_id));
-            index += 1;
-        }
-
         let mut streams_and_min_entry_ids: Vec<(&str, &StreamType, Option<&str>)> = vec![];
 
         let storage = storage.lock().await;
-        for (stream_key, min_entry_id) in stream_key_and_min_entry_id_list {
-            match storage.get(stream_key) {
+        for (stream_key, min_entry_id) in &stream_key_and_min_entry_id_list {
+            match storage.get(*stream_key) {
                 Some(StoredValue {
                     value: Value::Stream(stream),
                     ..
