@@ -2,7 +2,7 @@ use crate::serializer::{
     filter_and_serialize_stream_to_resp_data_xrange_format,
     filter_and_serialize_stream_to_resp_data_xread_format, parse_resp_data, RespData,
 };
-use crate::structs::{ServerInfo, ServerMessageChannels, StoredValue, StreamEntryResult, Value};
+use crate::structs::{ServerInfo, ServerMessageChannels, StoredValue, StreamEntryResult, Value, StreamType};
 use crate::utils::{self, validate_and_generate_entry_id};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -387,28 +387,44 @@ pub async fn handle_xread_command(
         unimplemented!();
     }
 
-    let stream_key = &args[2];
-    let min_entry_id = &args[3];
+    let mut index = 2;
+    let mut stream_key_and_min_entry_id_list: Vec<(&str, &str)> = vec![]; 
+    let mut num_keys = 0;
+    //XREAD streams stream_key other_stream_key 0-0 0-1
+    while index < args.len() && !args[index].contains("-") {
+        num_keys += 1;
+        index += 1;
+    }
+    index = 2;
+    while index < 2 + num_keys {
+        let stream_key = &args[index];
+        let min_entry_id = &args[index + num_keys];
+        stream_key_and_min_entry_id_list.push((stream_key, min_entry_id));
+        index += 1;
+    }
+    
+    let mut streams_and_min_entry_ids: Vec<(&str, &StreamType, Option<&str>)> = vec![];
 
     let storage = storage.lock().await;
-    match storage.get(stream_key) {
-        Some(StoredValue {
-            value: Value::Stream(stream),
-            ..
-        }) => {
-            let streams_and_min_entry_ids =
-                vec![(stream_key.as_str(), stream, Some(min_entry_id.as_str()))];
-            let resp_data =
-                filter_and_serialize_stream_to_resp_data_xread_format(streams_and_min_entry_ids);
-            tcp_stream
-                .write_all(resp_data.serialize_to_redis_protocol().as_bytes())
-                .await?;
-        }
-        _ => {
-            tcp_stream.write_all("$-1\r\n".as_bytes()).await?;
-            return Ok(());
-        }
-    };
+    for (stream_key, min_entry_id) in stream_key_and_min_entry_id_list {
+        match storage.get(stream_key) {
+            Some(StoredValue {
+                value: Value::Stream(stream),
+                ..
+            }) => {
+                streams_and_min_entry_ids.push((stream_key, stream, Some(min_entry_id)));
+            }
+            _ => {
+                tcp_stream.write_all("$-1\r\n".as_bytes()).await?;
+                return Ok(());
+            }
+        };
+    }
+    let resp_data =
+        filter_and_serialize_stream_to_resp_data_xread_format(streams_and_min_entry_ids);
+    tcp_stream
+        .write_all(resp_data.serialize_to_redis_protocol().as_bytes())
+        .await?;
     Ok(())
 }
 
