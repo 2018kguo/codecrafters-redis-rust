@@ -2,13 +2,15 @@ use crate::serializer::{
     filter_and_serialize_stream_to_resp_data_xrange_format,
     filter_and_serialize_stream_to_resp_data_xread_format, parse_resp_data, RespData,
 };
-use crate::structs::{ServerInfo, ServerMessageChannels, StoredValue, StreamEntryResult, Value, StreamType};
+use crate::structs::{
+    ServerInfo, ServerMessageChannels, StoredValue, StreamEntryResult, StreamType, Value,
+};
 use crate::utils::{self, validate_and_generate_entry_id};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::io;
 use std::sync::Arc;
 use std::time;
+use std::{io, u64};
 use time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -381,28 +383,38 @@ pub async fn handle_xread_command(
 ) -> Result<()> {
     // XREAD streams stream_key 0-0
     let args = resp.serialize_to_list_of_strings(true);
-    let stream_arg = &args[1];
 
-    if stream_arg != "streams" {
-        unimplemented!();
+    let mut only_greater_than_min_id = false;
+    let block_arg_pos = args.iter().position(|arg| arg == "block");
+    if block_arg_pos.is_some() {
+        let block_arg_pos = block_arg_pos.unwrap();
+        let block_arg = &args[block_arg_pos + 1];
+        only_greater_than_min_id = true;
+        let ms = block_arg.parse::<u64>()?;
+        let block_duration = Duration::from_millis(block_arg.parse::<u64>()?);
+        println!("block duration {}", ms);
+        sleep(block_duration).await;
     }
 
-    let mut index = 2;
-    let mut stream_key_and_min_entry_id_list: Vec<(&str, &str)> = vec![]; 
+    // find the position of the streams argument
+    let streams_arg_pos = args.iter().position(|arg| arg == "streams").unwrap();
+
+    let mut index = streams_arg_pos + 1;
+    let mut stream_key_and_min_entry_id_list: Vec<(&str, &str)> = vec![];
     let mut num_keys = 0;
     //XREAD streams stream_key other_stream_key 0-0 0-1
     while index < args.len() && !args[index].contains("-") {
         num_keys += 1;
         index += 1;
     }
-    index = 2;
-    while index < 2 + num_keys {
+    index = streams_arg_pos + 1;
+    while index < streams_arg_pos + num_keys + 1 {
         let stream_key = &args[index];
         let min_entry_id = &args[index + num_keys];
         stream_key_and_min_entry_id_list.push((stream_key, min_entry_id));
         index += 1;
     }
-    
+
     let mut streams_and_min_entry_ids: Vec<(&str, &StreamType, Option<&str>)> = vec![];
 
     let storage = storage.lock().await;
@@ -420,8 +432,16 @@ pub async fn handle_xread_command(
             }
         };
     }
-    let resp_data =
-        filter_and_serialize_stream_to_resp_data_xread_format(streams_and_min_entry_ids);
+    let resp_data = filter_and_serialize_stream_to_resp_data_xread_format(
+        streams_and_min_entry_ids,
+        only_greater_than_min_id,
+    );
+    if let RespData::Array(ref array) = resp_data {
+        if array.is_empty() {
+            tcp_stream.write_all("$-1\r\n".as_bytes()).await?;
+            return Ok(());
+        }
+    }
     tcp_stream
         .write_all(resp_data.serialize_to_redis_protocol().as_bytes())
         .await?;

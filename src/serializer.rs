@@ -208,6 +208,7 @@ pub fn filter_and_serialize_stream_to_resp_data_xrange_format(
 
 pub fn filter_and_serialize_stream_to_resp_data_xread_format(
     streams_and_min_entry_ids: Vec<(&str, &StreamType, Option<&str>)>,
+    only_greater_than_min: bool,
 ) -> RespData {
     // returns data in the following format w/ the stream key included
     //[
@@ -239,7 +240,11 @@ pub fn filter_and_serialize_stream_to_resp_data_xread_format(
 
             let is_ge_than_min = min_entry_id.is_none()
                 || min_entry_id.unwrap() == "-"
-                || (compare_stream_entry_ids(min_entry_id.unwrap(), entry_key) <= 0);
+                || (if only_greater_than_min {
+                    compare_stream_entry_ids(min_entry_id.unwrap(), entry_key) < 0
+                } else {
+                    compare_stream_entry_ids(min_entry_id.unwrap(), entry_key) <= 0
+                });
 
             if !is_ge_than_min {
                 continue;
@@ -253,9 +258,15 @@ pub fn filter_and_serialize_stream_to_resp_data_xread_format(
                 entry_data.push(RespData::BulkString(key.to_string()));
                 entry_data.push(RespData::BulkString(value.to_string()));
             }
+            if entry_data.is_empty() {
+                continue;
+            }
             entry_array.push(RespData::Array(entry_data));
             entries_array.push(RespData::Array(entry_array));
             //stream_array.push(RespData::Array(entry_array));
+        }
+        if entries_array.is_empty() {
+            continue;
         }
         stream_array.push(RespData::Array(entries_array));
         resp_array.push(RespData::Array(stream_array));
