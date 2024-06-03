@@ -207,7 +207,7 @@ pub fn filter_and_serialize_stream_to_resp_data_xrange_format(
 }
 
 pub fn filter_and_serialize_stream_to_resp_data_xread_format(
-    streams_and_min_entry_ids: Vec<(&str, &StreamType, Option<&str>)>,
+    streams_and_min_entry_ids: &Vec<(&str, &StreamType, Option<&str>)>,
     only_greater_than_min: bool,
 ) -> RespData {
     // returns data in the following format w/ the stream key included
@@ -231,7 +231,7 @@ pub fn filter_and_serialize_stream_to_resp_data_xread_format(
         let mut entries_array = Vec::new();
         // add stream_key
         stream_array.push(RespData::BulkString(stream_key.to_string()));
-        for entry in stream {
+        for entry in *stream {
             let mut entry_array = Vec::new();
 
             let mut entry_data = Vec::new();
