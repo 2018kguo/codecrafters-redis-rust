@@ -117,17 +117,15 @@ pub fn validate_and_generate_entry_id(
             return Ok(StreamEntryResult::ErrorMessage(error_msg.to_string()));
         }
         std::cmp::Ordering::Greater => {}
-        std::cmp::Ordering::Equal => {
-            match new_entry_id_sequence.cmp(&latest_entry_id_sequence) {
-                std::cmp::Ordering::Less => {
-                    return Ok(StreamEntryResult::ErrorMessage(error_msg.to_string()));
-                }
-                std::cmp::Ordering::Greater => {}
-                std::cmp::Ordering::Equal => {
-                    return Ok(StreamEntryResult::ErrorMessage(error_msg.to_string()));
-                }
+        std::cmp::Ordering::Equal => match new_entry_id_sequence.cmp(&latest_entry_id_sequence) {
+            std::cmp::Ordering::Less => {
+                return Ok(StreamEntryResult::ErrorMessage(error_msg.to_string()));
             }
-        }
+            std::cmp::Ordering::Greater => {}
+            std::cmp::Ordering::Equal => {
+                return Ok(StreamEntryResult::ErrorMessage(error_msg.to_string()));
+            }
+        },
     }
     let new_entry_id = format!("{}-{}", new_entry_id_timestamp, new_entry_id_sequence);
     println!("new entry id: {}", new_entry_id);

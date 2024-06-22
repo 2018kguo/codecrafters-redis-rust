@@ -684,8 +684,15 @@ pub async fn handle_exec_command(
     is_replica: bool,
     handshake_with_master_complete: bool,
 ) -> Result<()> {
+    if !transaction_data.in_transaction {
+        stream
+            .write_all("-ERR EXEC without MULTI\r\n".as_bytes())
+            .await?;
+        return Ok(());
+    }
     transaction_data.in_transaction = false;
     let commands = transaction_data.commands.clone();
+    let mut resp_responses: Vec<RespData> = Vec::new();
     for (command, resp, message_bytes) in commands {
         match command.as_str() {
             "SET" => {
@@ -720,6 +727,9 @@ pub async fn handle_exec_command(
         }
     }
     transaction_data.commands.clear();
-    stream.write_all("+OK\r\n".as_bytes()).await?;
+    let resp_array = RespData::Array(resp_responses);
+    stream
+        .write_all(resp_array.serialize_to_redis_protocol().as_bytes())
+        .await?;
     Ok(())
 }
