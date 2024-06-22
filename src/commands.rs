@@ -614,8 +614,15 @@ pub async fn handle_incr_command(
     });
     let new_value = match &value.value {
         Value::String(string_value) => {
-            let int_value = string_value.parse::<u64>()?;
-            int_value + 1
+            let int_value = string_value.parse::<u64>();
+            if let Some(parsed_int_value) = int_value.ok() {
+                parsed_int_value + 1
+            } else {
+                stream
+                    .write_all("-ERR value is not an integer or out of range\r\n".as_bytes())
+                    .await?;
+                return Ok(());
+            }
         }
         _ => {
             return Err(anyhow::anyhow!("Invalid value type"));
