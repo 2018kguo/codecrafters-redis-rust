@@ -599,3 +599,32 @@ pub async fn handle_wait_command(
     }
     Ok(())
 }
+
+pub async fn handle_incr_command(
+    stream: &mut TcpStream,
+    storage: Arc<Mutex<HashMap<String, StoredValue>>>,
+    resp: &RespData,
+) -> Result<()> {
+    let incr_resp = resp.serialize_to_list_of_strings(false);
+    let key_str = incr_resp[1].clone();
+    let mut held_storage = storage.lock().await;
+    let value = held_storage.entry(key_str.clone()).or_insert(StoredValue {
+        value: Value::String("0".to_string()),
+        expiry: None,
+    });
+    let new_value = match &value.value {
+        Value::String(string_value) => {
+            let int_value = string_value.parse::<u64>()?;
+            int_value + 1
+        }
+        _ => {
+            return Err(anyhow::anyhow!("Invalid value type"));
+        }
+    };
+    value.value = Value::String(new_value.to_string());
+    let resp_response = RespData::Integer(new_value as isize);
+    stream
+        .write_all(resp_response.serialize_to_redis_protocol().as_bytes())
+        .await?;
+    Ok(())
+}
