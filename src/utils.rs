@@ -103,7 +103,7 @@ pub fn validate_and_generate_entry_id(
     };
     println!("new entry id sequence: {}", new_entry_id_sequence);
 
-    let error_msg = if new_entry_id_timestamp <= 0 && new_entry_id_sequence <= 0 {
+    let error_msg = if new_entry_id_timestamp == 0 && new_entry_id_sequence == 0 {
         "-ERR The ID specified in XADD must be greater than 0-0\r\n"
     } else {
         "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"
@@ -112,12 +112,21 @@ pub fn validate_and_generate_entry_id(
         "new entry id timestamp: {}, latest entry id timestamp: {}",
         new_entry_id_timestamp, latest_entry_id_timestamp
     );
-    if new_entry_id_timestamp < latest_entry_id_timestamp {
-        return Ok(StreamEntryResult::ErrorMessage(error_msg.to_string()));
-    } else if new_entry_id_timestamp == latest_entry_id_timestamp {
-        let latest_entry_id_sequence = latest_entry_id_parts[1].parse::<u64>()?;
-        if new_entry_id_sequence <= latest_entry_id_sequence {
+    match new_entry_id_timestamp.cmp(&latest_entry_id_timestamp) {
+        std::cmp::Ordering::Less => {
             return Ok(StreamEntryResult::ErrorMessage(error_msg.to_string()));
+        }
+        std::cmp::Ordering::Greater => {}
+        std::cmp::Ordering::Equal => {
+            match new_entry_id_sequence.cmp(&latest_entry_id_sequence) {
+                std::cmp::Ordering::Less => {
+                    return Ok(StreamEntryResult::ErrorMessage(error_msg.to_string()));
+                }
+                std::cmp::Ordering::Greater => {}
+                std::cmp::Ordering::Equal => {
+                    return Ok(StreamEntryResult::ErrorMessage(error_msg.to_string()));
+                }
+            }
         }
     }
     let new_entry_id = format!("{}-{}", new_entry_id_timestamp, new_entry_id_sequence);
@@ -136,17 +145,13 @@ pub fn compare_stream_entry_ids(e1: &str, e2: &str) -> i8 {
     let e1_sequence = e1_parts[1].parse::<u64>().unwrap();
     let e2_sequence = e2_parts[1].parse::<u64>().unwrap();
 
-    if e1_timestamp < e2_timestamp {
-        -1
-    } else if e1_timestamp > e2_timestamp {
-        1
-    } else {
-        if e1_sequence < e2_sequence {
-            -1
-        } else if e1_sequence > e2_sequence {
-            1
-        } else {
-            0
-        }
+    match e1_timestamp.cmp(&e2_timestamp) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Greater => 1,
+        std::cmp::Ordering::Equal => match e1_sequence.cmp(&e2_sequence) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Greater => 1,
+            std::cmp::Ordering::Equal => 0,
+        },
     }
 }
