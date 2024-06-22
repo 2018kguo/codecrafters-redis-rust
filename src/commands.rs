@@ -79,7 +79,6 @@ pub async fn handle_type_command(
 }
 
 pub async fn handle_set_command(
-    stream: &mut TcpStream,
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
     sender: Arc<Sender<Vec<u8>>>,
     message_bytes: &[u8],
@@ -88,14 +87,13 @@ pub async fn handle_set_command(
     handshake_with_master_complete: bool,
     server_info: Arc<Mutex<ServerInfo>>,
     transaction_data: &mut TransactionData,
-) -> Result<()> {
+) -> Result<Option<Vec<u8>>> {
     // if we're in a transaction, just add the command to the transaction data
     if transaction_data.in_transaction {
         transaction_data
             .commands
             .push(("SET".to_string(), resp, message_bytes.to_vec()));
-        stream.write_all("+QUEUED\r\n".as_bytes()).await?;
-        return Ok(());
+        return Ok(Some("+QUEUED\r\n".as_bytes().to_vec()));
     }
 
     let set_resp = resp.serialize_to_list_of_strings(false);
@@ -135,10 +133,6 @@ pub async fn handle_set_command(
         let mut server_info = server_info.lock().await;
         server_info.num_command_bytes_processed_as_replica += message_bytes.len();
     }
-    // return OK as a simple string
-    if !handshake_with_master_complete {
-        stream.write_all("+OK\r\n".as_bytes()).await?;
-    }
     // send the same bytes that we read for this command to all of the
     // connected replicas. Since the replicas run the same code they will
     // parse the command the same way so we don't need to re-serialize the
@@ -156,7 +150,10 @@ pub async fn handle_set_command(
         server_info.master_repl_offset += message_bytes.len();
         sender.send(message_bytes.to_vec())?;
     }
-    Ok(())
+    if !handshake_with_master_complete {
+        return Ok(Some("+OK\r\n".as_bytes().to_vec()));
+    }
+    Ok(None)
 }
 
 pub async fn handle_psync_command(
@@ -697,7 +694,6 @@ pub async fn handle_exec_command(
         match command.as_str() {
             "SET" => {
                 handle_set_command(
-                    stream,
                     storage.clone(),
                     sender.clone(),
                     &message_bytes,
