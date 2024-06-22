@@ -467,8 +467,7 @@ async fn read_and_handle_single_command_from_local_buffer(
                 message_channels.sender.clone(),
                 server_info.clone(),
                 transaction_data,
-                is_replica,
-                handshake_with_master_complete,
+                is_replica, 
             )
             .await?;
         }

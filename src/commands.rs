@@ -3,7 +3,8 @@ use crate::serializer::{
     filter_and_serialize_stream_to_resp_data_xread_format, parse_resp_data, RespData,
 };
 use crate::structs::{
-    ServerInfo, ServerMessageChannels, StoredValue, StreamEntryResult, StreamType, Value,
+    ServerInfo, ServerMessageChannels, StoredValue, StreamEntryResult, StreamType, TransactionData,
+    Value,
 };
 use crate::utils::{self, validate_and_generate_entry_id};
 use anyhow::Result;
@@ -86,7 +87,17 @@ pub async fn handle_set_command(
     is_replica: bool,
     handshake_with_master_complete: bool,
     server_info: Arc<Mutex<ServerInfo>>,
+    transaction_data: &mut TransactionData,
 ) -> Result<()> {
+    // if we're in a transaction, just add the command to the transaction data
+    if transaction_data.in_transaction {
+        transaction_data
+            .commands
+            .push(("SET".to_string(), resp, message_bytes.to_vec()));
+        stream.write_all("+QUEUED\r\n".as_bytes()).await?;
+        return Ok(());
+    }
+
     let set_resp = resp.serialize_to_list_of_strings(false);
     // the second element in the array is the key
     let key_str = &set_resp[1];
@@ -285,8 +296,7 @@ pub async fn handle_xadd_command(
             value: Value::Stream(stream),
             ..
         }) => {
-            let stream_entry_result =
-                validate_and_generate_entry_id(&stream, entry_id.to_string())?;
+            let stream_entry_result = validate_and_generate_entry_id(stream, entry_id.to_string())?;
             match stream_entry_result {
                 StreamEntryResult::ErrorMessage(error_msg) => {
                     StreamEntryResult::ErrorMessage(error_msg)
@@ -410,7 +420,7 @@ pub async fn handle_xread_command(
     let mut stream_key_and_min_entry_id_list: Vec<(&str, String)> = vec![];
     let mut num_keys = 0;
     //XREAD streams stream_key other_stream_key 0-0 0-1
-    while index < args.len() && !args[index].contains("-") && !(args[index] == "$") {
+    while index < args.len() && !args[index].contains('-') && args[index] != "$" {
         println!("contents of args: {}", args[index]);
         num_keys += 1;
         index += 1;
@@ -487,12 +497,10 @@ pub async fn handle_xread_command(
                     continue;
                 }
             }
-        } else {
-            if let RespData::Array(ref array) = resp_data {
-                if array.is_empty() {
-                    tcp_stream.write_all("$-1\r\n".as_bytes()).await?;
-                    return Ok(());
-                }
+        } else if let RespData::Array(ref array) = resp_data {
+            if array.is_empty() {
+                tcp_stream.write_all("$-1\r\n".as_bytes()).await?;
+                return Ok(());
             }
         }
         tcp_stream
@@ -603,8 +611,21 @@ pub async fn handle_wait_command(
 pub async fn handle_incr_command(
     stream: &mut TcpStream,
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
-    resp: &RespData,
+    resp: RespData,
+    message_bytes: &[u8],
+    is_replica: bool,
+    transaction_data: &mut TransactionData,
+    server_info: Arc<Mutex<ServerInfo>>,
 ) -> Result<()> {
+    // if we're in a transaction, just add the command to the transaction data
+    // and return QUEUED
+    if transaction_data.in_transaction {
+        transaction_data
+            .commands
+            .push(("INCR".to_string(), resp, message_bytes.to_vec()));
+        stream.write_all("+QUEUED\r\n".as_bytes()).await?;
+        return Ok(());
+    }
     let incr_resp = resp.serialize_to_list_of_strings(false);
     let key_str = incr_resp[1].clone();
     let mut held_storage = storage.lock().await;
@@ -615,7 +636,7 @@ pub async fn handle_incr_command(
     let new_value = match &value.value {
         Value::String(string_value) => {
             let int_value = string_value.parse::<u64>();
-            if let Some(parsed_int_value) = int_value.ok() {
+            if let Ok(parsed_int_value) = int_value {
                 parsed_int_value + 1
             } else {
                 stream
@@ -630,8 +651,75 @@ pub async fn handle_incr_command(
     };
     value.value = Value::String(new_value.to_string());
     let resp_response = RespData::Integer(new_value as isize);
+
     stream
         .write_all(resp_response.serialize_to_redis_protocol().as_bytes())
         .await?;
+
+    if is_replica {
+        let mut server_info = server_info.lock().await;
+        server_info.num_command_bytes_processed_as_replica += message_bytes.len();
+    } else {
+        let mut server_info = server_info.lock().await;
+        server_info.master_repl_offset += message_bytes.len();
+    }
+    Ok(())
+}
+
+pub async fn handle_multi_command(
+    stream: &mut TcpStream,
+    transaction_data: &mut TransactionData,
+) -> Result<()> {
+    transaction_data.in_transaction = true;
+    stream.write_all("+OK\r\n".as_bytes()).await?;
+    Ok(())
+}
+
+pub async fn handle_exec_command(
+    stream: &mut TcpStream,
+    storage: Arc<Mutex<HashMap<String, StoredValue>>>,
+    sender: Arc<Sender<Vec<u8>>>,
+    server_info: Arc<Mutex<ServerInfo>>,
+    transaction_data: &mut TransactionData,
+    is_replica: bool,
+    handshake_with_master_complete: bool,
+) -> Result<()> {
+    transaction_data.in_transaction = false;
+    let commands = transaction_data.commands.clone();
+    for (command, resp, message_bytes) in commands {
+        match command.as_str() {
+            "SET" => {
+                handle_set_command(
+                    stream,
+                    storage.clone(),
+                    sender.clone(),
+                    &message_bytes,
+                    resp.clone(),
+                    is_replica,
+                    handshake_with_master_complete,
+                    server_info.clone(),
+                    transaction_data,
+                )
+                .await?;
+            }
+            "INCR" => {
+                handle_incr_command(
+                    stream,
+                    storage.clone(),
+                    resp.clone(),
+                    &message_bytes,
+                    is_replica,
+                    transaction_data,
+                    server_info.clone(),
+                )
+                .await?;
+            }
+            _ => {
+                unimplemented!();
+            }
+        }
+    }
+    transaction_data.commands.clear();
+    stream.write_all("+OK\r\n".as_bytes()).await?;
     Ok(())
 }

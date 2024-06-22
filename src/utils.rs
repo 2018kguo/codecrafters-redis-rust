@@ -137,16 +137,16 @@ pub fn compare_stream_entry_ids(e1: &str, e2: &str) -> i8 {
     let e2_sequence = e2_parts[1].parse::<u64>().unwrap();
 
     if e1_timestamp < e2_timestamp {
-        return -1;
+        -1
     } else if e1_timestamp > e2_timestamp {
-        return 1;
+        1
     } else {
         if e1_sequence < e2_sequence {
-            return -1;
+            -1
         } else if e1_sequence > e2_sequence {
-            return 1;
+            1
         } else {
-            return 0;
+            0
         }
     }
 }

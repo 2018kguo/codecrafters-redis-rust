@@ -6,6 +6,8 @@ use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
+use crate::serializer::RespData;
+
 pub type StreamType = Vec<(String, Vec<(String, String)>)>;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -23,6 +25,20 @@ pub enum StreamEntryResult {
 pub struct StoredValue {
     pub value: Value,
     pub expiry: Option<Instant>,
+}
+
+pub struct TransactionData {
+    pub commands: Vec<(String, RespData, Vec<u8>)>, // stores SET <serialized command> <raw bytes>
+    pub in_transaction: bool,
+}
+
+impl TransactionData {
+    pub fn new() -> TransactionData {
+        TransactionData {
+            commands: Vec::new(),
+            in_transaction: false,
+        }
+    }
 }
 
 pub struct ServerInfo {
