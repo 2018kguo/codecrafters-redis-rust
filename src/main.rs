@@ -287,7 +287,7 @@ async fn read_and_handle_single_command_from_local_buffer(
             }
         }
         "set" => {
-            let response_bytes = handle_set_command(
+            let resp_data_response = handle_set_command(
                 storage.clone(),
                 message_channels.sender.clone(),
                 &message_bytes,
@@ -298,8 +298,9 @@ async fn read_and_handle_single_command_from_local_buffer(
                 transaction_data,
             )
             .await?;
-            if let Some(resp_bytes) = response_bytes {
-                stream.write_all(resp_bytes.as_slice()).await?;
+            if let Some(resp_response) = resp_data_response {
+                let resp_bytes = resp_response.serialize_to_redis_protocol();
+                stream.write_all(resp_bytes.as_bytes()).await?;
             }
         }
         "get" => {
@@ -448,8 +449,7 @@ async fn read_and_handle_single_command_from_local_buffer(
             handle_xread_command(stream, storage.clone(), &resp).await?;
         }
         "incr" => {
-            handle_incr_command(
-                stream,
+            let resp_data_response = handle_incr_command(
                 storage.clone(),
                 resp,
                 &message_bytes,
@@ -458,6 +458,10 @@ async fn read_and_handle_single_command_from_local_buffer(
                 server_info.clone(),
             )
             .await?;
+            if let Some(resp_response) = resp_data_response {
+                let resp_bytes = resp_response.serialize_to_redis_protocol();
+                stream.write_all(resp_bytes.as_bytes()).await?;
+            }
         }
         "multi" => {
             handle_multi_command(stream, transaction_data).await?;

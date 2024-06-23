@@ -8,11 +8,13 @@ pub enum RespData {
     BulkString(String),
     Array(Vec<RespData>),
     Integer(isize),
+    SimpleError(String),
 }
 
 impl RespData {
     pub fn serialize_to_redis_protocol(&self) -> String {
         match self {
+            RespData::SimpleError(data) => format!("-{}\r\n", data),
             RespData::SimpleString(data) => format!("+{}\r\n", data),
             RespData::BulkString(data) => format!("${}\r\n{}\r\n", data.len(), data),
             RespData::Array(data) => {
@@ -40,6 +42,7 @@ impl RespData {
                 serialized_data
             }
             RespData::Integer(data) => vec![data.to_string()],
+            RespData::SimpleError(data) => vec![data.to_string()],
         };
         if lowercase {
             string_vec.iter().map(|s| s.to_lowercase()).collect()

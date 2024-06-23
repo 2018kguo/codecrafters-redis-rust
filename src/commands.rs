@@ -87,13 +87,13 @@ pub async fn handle_set_command(
     handshake_with_master_complete: bool,
     server_info: Arc<Mutex<ServerInfo>>,
     transaction_data: &mut TransactionData,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<RespData>> {
     // if we're in a transaction, just add the command to the transaction data
     if transaction_data.in_transaction {
         transaction_data
             .commands
             .push(("SET".to_string(), resp, message_bytes.to_vec()));
-        return Ok(Some("+QUEUED\r\n".as_bytes().to_vec()));
+        return Ok(Some(RespData::SimpleString("QUEUED".to_string())));
     }
 
     let set_resp = resp.serialize_to_list_of_strings(false);
@@ -151,7 +151,7 @@ pub async fn handle_set_command(
         sender.send(message_bytes.to_vec())?;
     }
     if !handshake_with_master_complete {
-        return Ok(Some("+OK\r\n".as_bytes().to_vec()));
+        return Ok(Some(RespData::SimpleString("OK".to_string())));
     }
     Ok(None)
 }
@@ -606,22 +606,20 @@ pub async fn handle_wait_command(
 }
 
 pub async fn handle_incr_command(
-    stream: &mut TcpStream,
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
     resp: RespData,
     message_bytes: &[u8],
     is_replica: bool,
     transaction_data: &mut TransactionData,
     server_info: Arc<Mutex<ServerInfo>>,
-) -> Result<()> {
+) -> Result<Option<RespData>> {
     // if we're in a transaction, just add the command to the transaction data
     // and return QUEUED
     if transaction_data.in_transaction {
         transaction_data
             .commands
             .push(("INCR".to_string(), resp, message_bytes.to_vec()));
-        stream.write_all("+QUEUED\r\n".as_bytes()).await?;
-        return Ok(());
+        return Ok(Some(RespData::SimpleString("QUEUED".to_string())));
     }
     let incr_resp = resp.serialize_to_list_of_strings(false);
     let key_str = incr_resp[1].clone();
@@ -636,10 +634,9 @@ pub async fn handle_incr_command(
             if let Ok(parsed_int_value) = int_value {
                 parsed_int_value + 1
             } else {
-                stream
-                    .write_all("-ERR value is not an integer or out of range\r\n".as_bytes())
-                    .await?;
-                return Ok(());
+                return Ok(Some(RespData::SimpleError(
+                    "ERR value is not an integer or out of range".to_string(),
+                )));
             }
         }
         _ => {
@@ -649,10 +646,6 @@ pub async fn handle_incr_command(
     value.value = Value::String(new_value.to_string());
     let resp_response = RespData::Integer(new_value as isize);
 
-    stream
-        .write_all(resp_response.serialize_to_redis_protocol().as_bytes())
-        .await?;
-
     if is_replica {
         let mut server_info = server_info.lock().await;
         server_info.num_command_bytes_processed_as_replica += message_bytes.len();
@@ -660,7 +653,7 @@ pub async fn handle_incr_command(
         let mut server_info = server_info.lock().await;
         server_info.master_repl_offset += message_bytes.len();
     }
-    Ok(())
+    Ok(Some(resp_response))
 }
 
 pub async fn handle_multi_command(
@@ -682,8 +675,9 @@ pub async fn handle_exec_command(
     handshake_with_master_complete: bool,
 ) -> Result<()> {
     if !transaction_data.in_transaction {
+        let error = RespData::SimpleError("ERR EXEC without MULTI".to_string());
         stream
-            .write_all("-ERR EXEC without MULTI\r\n".as_bytes())
+            .write_all(error.serialize_to_redis_protocol().as_bytes())
             .await?;
         return Ok(());
     }
@@ -693,7 +687,7 @@ pub async fn handle_exec_command(
     for (command, resp, message_bytes) in commands {
         match command.as_str() {
             "SET" => {
-                handle_set_command(
+                let response_resp_data = handle_set_command(
                     storage.clone(),
                     sender.clone(),
                     &message_bytes,
@@ -704,10 +698,12 @@ pub async fn handle_exec_command(
                     transaction_data,
                 )
                 .await?;
+                if let Some(resp_data) = response_resp_data {
+                    resp_responses.push(resp_data);
+                }
             }
             "INCR" => {
-                handle_incr_command(
-                    stream,
+                let response_resp_data = handle_incr_command(
                     storage.clone(),
                     resp.clone(),
                     &message_bytes,
@@ -716,6 +712,9 @@ pub async fn handle_exec_command(
                     server_info.clone(),
                 )
                 .await?;
+                if let Some(resp_data) = response_resp_data {
+                    resp_responses.push(resp_data);
+                }
             }
             _ => {
                 unimplemented!();
