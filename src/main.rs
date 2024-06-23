@@ -304,7 +304,12 @@ async fn read_and_handle_single_command_from_local_buffer(
             }
         }
         "get" => {
-            handle_get_command(stream, storage.clone(), &resp).await?;
+            let resp_data_response =
+                handle_get_command(storage.clone(), &resp, transaction_data).await?;
+            if let Some(resp_response) = resp_data_response {
+                let resp_bytes = resp_response.serialize_to_redis_protocol();
+                stream.write_all(resp_bytes.as_bytes()).await?;
+            }
         }
         "info" => {
             // ex: redis-cli INFO replication

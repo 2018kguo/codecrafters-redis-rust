@@ -9,11 +9,13 @@ pub enum RespData {
     Array(Vec<RespData>),
     Integer(isize),
     SimpleError(String),
+    NullBulkString,
 }
 
 impl RespData {
     pub fn serialize_to_redis_protocol(&self) -> String {
         match self {
+            RespData::NullBulkString => "$-1\r\n".to_string(),
             RespData::SimpleError(data) => format!("-{}\r\n", data),
             RespData::SimpleString(data) => format!("+{}\r\n", data),
             RespData::BulkString(data) => format!("${}\r\n{}\r\n", data.len(), data),
@@ -32,6 +34,7 @@ impl RespData {
 
     pub fn serialize_to_list_of_strings(&self, lowercase: bool) -> Vec<String> {
         let string_vec = match self {
+            RespData::NullBulkString => vec!["$-1".to_string()],
             RespData::SimpleString(data) => vec![data.to_string()],
             RespData::BulkString(data) => vec![data.to_string()],
             RespData::Array(data) => {

@@ -21,10 +21,16 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
 pub async fn handle_get_command(
-    stream: &mut TcpStream,
     storage: Arc<Mutex<HashMap<String, StoredValue>>>,
     resp: &RespData,
-) -> Result<()> {
+    transaction_data: &mut TransactionData,
+) -> Result<Option<RespData>> {
+    if transaction_data.in_transaction {
+        transaction_data
+            .commands
+            .push(("GET".to_string(), resp.clone(), vec![]));
+        return Ok(Some(RespData::SimpleString("QUEUED".to_string())));
+    }
     let get_resp = RespData::unpack_array(resp);
     let key_str = get_resp[1].serialize_to_list_of_strings(false)[0].clone();
     let held_storage = storage.lock().await;
@@ -35,9 +41,7 @@ pub async fn handle_get_command(
             let string_value = stored_value.value.clone();
             if let Value::String(string_value) = string_value {
                 let resp_response = RespData::SimpleString(string_value);
-                stream
-                    .write_all(resp_response.serialize_to_redis_protocol().as_bytes())
-                    .await?;
+                return Ok(Some(resp_response));
             } else {
                 unimplemented!();
             }
@@ -45,10 +49,9 @@ pub async fn handle_get_command(
         // Key has either expired or never existed in the map.
         _ => {
             println!("Key not found");
-            stream.write_all("$-1\r\n".as_bytes()).await?;
+            return Ok(Some(RespData::NullBulkString));
         }
     }
-    Ok(())
 }
 
 pub async fn handle_type_command(
@@ -712,6 +715,13 @@ pub async fn handle_exec_command(
                     server_info.clone(),
                 )
                 .await?;
+                if let Some(resp_data) = response_resp_data {
+                    resp_responses.push(resp_data);
+                }
+            }
+            "GET" => {
+                let response_resp_data =
+                    handle_get_command(storage.clone(), &resp, transaction_data).await?;
                 if let Some(resp_data) = response_resp_data {
                     resp_responses.push(resp_data);
                 }
