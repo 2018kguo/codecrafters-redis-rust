@@ -41,7 +41,7 @@ pub async fn handle_get_command(
             let string_value = stored_value.value.clone();
             if let Value::String(string_value) = string_value {
                 let resp_response = RespData::SimpleString(string_value);
-                return Ok(Some(resp_response));
+                Ok(Some(resp_response))
             } else {
                 unimplemented!();
             }
@@ -49,7 +49,7 @@ pub async fn handle_get_command(
         // Key has either expired or never existed in the map.
         _ => {
             println!("Key not found");
-            return Ok(Some(RespData::NullBulkString));
+            Ok(Some(RespData::NullBulkString))
         }
     }
 }
