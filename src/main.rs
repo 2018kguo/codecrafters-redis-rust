@@ -483,6 +483,12 @@ async fn read_and_handle_single_command_from_local_buffer(
             )
             .await?;
         }
+        "discard" => {
+            let resp_data = handle_discard_command(transaction_data).await?;
+            stream
+                .write_all(resp_data.serialize_to_redis_protocol().as_bytes())
+                .await?;
+        }
         _ => {
             // slaves receive the FULLRESYNC command from the master
             // as well as the RDB file which we don't want to respond to with an error

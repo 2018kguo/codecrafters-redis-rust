@@ -738,3 +738,14 @@ pub async fn handle_exec_command(
         .await?;
     Ok(())
 }
+
+pub async fn handle_discard_command(transaction_data: &mut TransactionData) -> Result<RespData> {
+    if !transaction_data.in_transaction {
+        return Ok(RespData::SimpleError(
+            "ERR DISCARD without MULTI".to_string(),
+        ));
+    }
+    transaction_data.in_transaction = false;
+    transaction_data.commands.clear();
+    Ok(RespData::SimpleString("OK".to_string()))
+}
